@@ -313,11 +313,167 @@ class StageI(nn.Module):
         return self.conv_2(self.relu_1(self.conv_1(self.pad_1(x))))
 
 
+class StageJ(nn.Module):
+    """Branching main path: stem's output feeds TWO downstream bundles as MAIN
+    input (not a residual add) - conv_shortcut (1x1) and conv_main (3x3) - the
+    ResNet downsample-block shape. Their outputs are then combined the same way
+    StageF's residual add already is, giving the real block: 1x1 shortcut +
+    3x3 main path, summed.
+
+    stem's output channel count (16) is capped by check_hardware's ACC_WIDTH
+    bound (K_BITS + X_BITS + clog2(KH*KW*CI) <= 24, the float32 mantissa
+    _conv2d_same's golden per-pass sums are exact within) - a 3x3 kernel at
+    K_BITS=X_BITS=8 caps CI at 28, well under the 64 the docs/superpowers/
+    specs/2026-08-14-resnet-remaining-gaps-design.md measurement used. What
+    actually matters for exercising the bug does not need that literal channel
+    count, though: X_PAD is driven by kernel HEIGHT, not channel count, and is
+    0 for the 1x1 shortcut but nonzero for the 3x3 main path regardless of CI -
+    that alone gives the two consumers genuinely different engine tilings of
+    the same producer tensor, which is exactly what runtime.h's tile_write
+    could not route to more than one consumer before this fix.
+
+    conv_shortcut needs no `branches` entry: it is literally the next bundle
+    after stem in the flat child list, so it already gets stem's output as its
+    default main input. conv_main DOES need one - without it, its default main
+    input would be conv_shortcut's output (the wrong, but plausible-looking,
+    literal predecessor) instead of stem's.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.stem = nn.Conv2d(CHANNELS, 16, kernel_size=3, padding='same', bias=True)
+        self.relu_stem = nn.ReLU()
+        self.conv_shortcut = nn.Conv2d(16, 8, kernel_size=1, bias=True)
+        self.relu_shortcut = nn.ReLU()
+        self.conv_main = nn.Conv2d(16, 8, kernel_size=3, padding='same', bias=True)
+        self.relu_main = nn.ReLU()
+        self.conv_out = nn.Conv2d(8, 2, kernel_size=1, bias=True)
+
+    def forward(self, x):
+        x = stem = self.relu_stem(self.stem(x))
+        shortcut = self.relu_shortcut(self.conv_shortcut(stem))
+        x = self.relu_main(self.conv_main(stem)) + shortcut
+        return self.conv_out(x)
+
+
+class StageK(nn.Module):
+    """Real post-add activation - the standard ResNet BasicBlock shape
+    (activation AFTER the sum), unlike StageF which lets add_act default to
+    Identity. conv_2's own pre-add activation (relu_2) still has to match
+    skip's type for the raw-add scale-sharing to work (unchanged requirement,
+    same as StageF) - lrelu_post is the NEW thing: a genuinely different
+    activation TYPE applied to the sum, with its own independently
+    calibrated scale, detected because it is the next real activation module
+    in the flat child list past conv_2's own activation. Using a different
+    type than relu_2 (not another ReLU) is deliberate - it is what would
+    expose a bug where the post-add detection accidentally reused conv_2's
+    activation instead of building a fresh one.
+
+    Ends on a conv with no softmax so the final RTL comparison is a genuine
+    integer one.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.conv_1 = nn.Conv2d(CHANNELS, 8, kernel_size=3, padding='same', bias=True)
+        self.relu_1 = nn.ReLU()
+        self.conv_2 = nn.Conv2d(8, 8, kernel_size=3, padding='same', bias=True)
+        self.relu_2 = nn.ReLU()
+        self.lrelu_post = nn.LeakyReLU(0.125)
+        self.conv_4 = nn.Conv2d(8, 2, kernel_size=1, bias=True)
+
+    def forward(self, x):
+        x = skip = self.relu_1(self.conv_1(x))
+        x = self.relu_2(self.conv_2(x)) + skip
+        x = self.lrelu_post(x)
+        return self.conv_4(x)
+
+
+class StageL(nn.Module):
+    """Same shape as StageA (1x1 conv only, no pool/flatten/softmax - the
+    final bundle's check stays a genuine integer comparison) but built with
+    16-bit activations rather than the default 8 - see conv_main.py's
+    STAGE_ACT_BITS. The point isn't conv geometry (already proven by StageA);
+    it's exercising the widened write_x/pack_words_into_bytes/dnn_engine.v
+    tkeep paths that only fire once a word needs more than one byte.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.conv_1 = nn.Conv2d(CHANNELS, 4, kernel_size=1, bias=True)
+        self.relu_1 = nn.ReLU()
+        self.conv_2 = nn.Conv2d(4, 2, kernel_size=1, bias=True)
+
+    def forward(self, x):
+        x = self.conv_1(x)
+        x = self.relu_1(x)
+        x = self.conv_2(x)
+        return x
+
+
+class StageM(nn.Module):
+    """Residual sourced from a POOLED bundle - stem ends in MaxPool2d, and
+    conv_2's residual add uses stem's (pooled) output as its skip identity.
+    Mirrors FashionMNISTModel's real shape (stem -> pool -> residual block,
+    whose `identity` is the already-pooled tensor) - a combination no prior
+    stage exercises (StageF/K's residual sources have no pool; StageD/G's
+    pooling isn't used as a residual source). Settles empirically whether
+    tile_write's add_buffers write (deepsocflow/c/runtime.h) captures the
+    pre-pool or post-pool value for a bundle that pools: it's a shared
+    subroutine called from two sites - once passing the raw pre-pool value
+    (no pooling), once passing the already-reduced `result` (pooling present)
+    - so which one actually executes depends on the CALL SITE, not the
+    function's own definition order in the file.
+
+    Ends on a conv with no softmax so the final RTL comparison is a genuine
+    integer one.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.stem = nn.Conv2d(CHANNELS, 8, kernel_size=3, padding='same', bias=True)
+        self.relu_stem = nn.ReLU()
+        self.pool_stem = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.conv_1 = nn.Conv2d(8, 8, kernel_size=3, padding='same', bias=True)
+        self.relu_1 = nn.ReLU()
+        self.conv_2 = nn.Conv2d(8, 8, kernel_size=3, padding='same', bias=True)
+        self.relu_2 = nn.ReLU()  # pre-add, must match relu_stem's type
+        self.conv_out = nn.Conv2d(8, 2, kernel_size=1, bias=True)
+
+    def forward(self, x):
+        x = skip = self.pool_stem(self.relu_stem(self.stem(x)))
+        x = self.relu_1(self.conv_1(x))
+        x = self.relu_2(self.conv_2(x)) + skip
+        return self.conv_out(x)
+
+
 # {consumer_attr: source_attr} handed to quantized_model as `residuals`.
-STAGE_RESIDUALS = {'f': {'conv_2': 'conv_1'}}
+STAGE_RESIDUALS = {'f': {'conv_2': 'conv_1'},
+                    'j': {'conv_main': 'conv_shortcut'},
+                    'k': {'conv_2': 'conv_1'},
+                    'm': {'conv_2': 'stem'}}
+
+# {consumer_attr: source_attr} handed to quantized_model as `branches` - a
+# consumer's MAIN input, not its residual add. See StageJ.
+STAGE_BRANCHES = {'j': {'conv_main': 'stem'}}
+
+# Per-stage activation bit width, handed to both Hardware(bits_input=...) and
+# quantized_model(act_bits=...) - every other stage stays at the default (8).
+STAGE_ACT_BITS = {'l': 16}
+
+# Per-stage accumulator bit width override, handed to Hardware(bits_sum=...).
+# rtl_export.py::export_bundle's own ACC_WIDTH check (distinct from
+# check_hardware's, which uses the model's real in_features) is
+# K_BITS + X_BITS + clog2(KH*KW*CM) where CM is padded up to the engine's
+# RAM_WEIGHTS_DEPTH capacity (512 by default) rather than the real channel
+# count - at X_BITS=16 that's 8+16+clog2(512)=33, already over the default
+# bits_sum=32. Every X_BITS<=8 stage stays comfortably under 32
+# (8+8+9=25), so only 'l' needs the override.
+STAGE_BITS_SUM = {'l': 40}
 
 STAGES = {'a': StageA, 'b': StageB, 'c': StageC, 'd': StageD, 'e': StageE,
-          'f': StageF, 'g': StageG, 'h': StageH, 'i': StageI}
+          'f': StageF, 'g': StageG, 'h': StageH, 'i': StageI, 'j': StageJ,
+          'k': StageK, 'l': StageL, 'm': StageM}
 
 
 def prime_batchnorm(model, x, batches=8):

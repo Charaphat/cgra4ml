@@ -58,15 +58,13 @@ def check_hardware(model, hw):
         assert acc_width <= hw.Y_BITS, (
             f"bundle '{name}': ACC_WIDTH={acc_width} > hw.Y_BITS={hw.Y_BITS}")
 
-        # rtl_export.py::_conv2d_same recomputes the golden per-pass conv sums in
-        # float32, so its 24-bit mantissa - not hw.Y_BITS - is the real ceiling on
-        # how large an exactly-representable accumulator can get. The two bounds
-        # are independent, and only this one catches a wide-but-Y_BITS-legal conv.
-        if bundle['type'] == 'conv':
-            assert acc_width <= 24, (
-                f"bundle '{name}': conv ACC_WIDTH={acc_width} exceeds float32's 24-bit "
-                f"mantissa, which rtl_export.py::_conv2d_same accumulates its golden "
-                f"per-pass sums in - those sums would round instead of being exact")
+        # rtl_export.py::_conv2d_same used to recompute the golden per-pass conv
+        # sums in float32, whose 24-bit mantissa was a second, independent ceiling
+        # on top of hw.Y_BITS above (it would round instead of being exact past
+        # ACC_WIDTH=24, catching a wide-but-Y_BITS-legal conv that the check above
+        # would miss). _conv2d_same now accumulates in int64, which has no such
+        # ceiling at the bit widths this project uses, so that separate assert is
+        # gone - hw.Y_BITS (checked above) is once again the only real bound.
 
         # Residual add. The hardware adds its two operands raw (runtime.h:451) -
         # Bundle_t carries no add_val_shift/add_a_shift - so they must already sit

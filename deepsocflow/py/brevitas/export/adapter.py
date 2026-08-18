@@ -262,7 +262,7 @@ def build_bundles(model, hw, has_bias=None):
         add_cfg = cfg.get('add')
         skip_from = cfg.get('skip_from')
         if add_cfg is not None:
-            add_nzero, add_plog = act_params(add_cfg['activation'])
+            add_nzero, add_plog = act_params(add_cfg['activation'], add_cfg.get('negative_slope', 0.0))
             # Both operands are on cfg['act_frac'] (check_hardware enforces it), so
             # the sum is too - that is the grid this shift starts from.
             add = _Add(source_ib=index_of[skip_from],
@@ -277,7 +277,7 @@ def build_bundles(model, hw, has_bias=None):
                      strides=pool_cfg['strides'], x=act_out,
                      padding=pool_cfg['padding']) if pool_cfg else None
 
-        non_zero, plog_slope = act_params(cfg['activation'])
+        non_zero, plog_slope = act_params(cfg['activation'], cfg.get('negative_slope', 0.0))
         shift_bits = plog_slope + acc_frac - cfg['act_frac']
 
         act = _Act(

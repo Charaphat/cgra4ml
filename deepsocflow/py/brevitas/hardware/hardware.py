@@ -71,7 +71,12 @@ class Hardware:
         self.params = {k:self.params[k] for k in self.params if not k == 'self'}
 
         # Validation
-        assert bits_input in [1,2,4,8] and bits_weights in [1,2,4,8]
+        # bits_input=16 is a real, RTL-supported width (dnn_engine.v's tkeep
+        # unpack and runtime.h's write_x both branch on X_BITS<=8 vs >8 - see
+        # the 2026-08-14 "widen activation datapath" work). bits_weights stays
+        # restricted to [1,2,4,8] - K_BITS widening is a separate, unstarted
+        # effort (only the weight-side tkeep generate branch exists so far).
+        assert bits_input in [1,2,4,8,16] and bits_weights in [1,2,4,8]
         assert bits_bias  in [8,16,32]
 
         self.ROWS, self.COLS = processing_elements  # PE (processing element) array: rows, cols

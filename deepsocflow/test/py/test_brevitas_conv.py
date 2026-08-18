@@ -250,6 +250,107 @@ def test_div_round_result_always_fits_the_activation_width():
             f"outside [{lo},{hi}]")
 
 
+def _c_quant_lrelu_table():
+    """Compiles and runs deepsocflow/test/c/quant_lrelu_dump.c, returning its
+    rows. quant_lrelu has never been exercised by any model built through this
+    backend before (relu/identity only, always pl_scale=0), so unlike
+    div_round there was no prior transcription bug to catch by comparison -
+    the asymmetric clip bound (negative side narrows by 2**pl_scale relative
+    to the positive side) is exactly the kind of thing that looks plausible
+    either way from reading the macro alone.
+    """
+    import pathlib, shutil, subprocess, tempfile
+
+    src = pathlib.Path(__file__).resolve().parents[1] / 'c' / 'quant_lrelu_dump.c'
+    cc = shutil.which('cc') or shutil.which('gcc')
+    if cc is None or not src.exists():
+        pytest.skip("no C compiler or quant_lrelu_dump.c not present")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        exe = pathlib.Path(tmp) / 'quant_lrelu_dump'
+        subprocess.run([cc, '-O2', '-o', str(exe), str(src)], check=True)
+        out = subprocess.run([str(exe)], check=True, capture_output=True, text=True).stdout
+    return [tuple(int(v) for v in line.split()) for line in out.splitlines()]
+
+
+def test_quant_lrelu_matches_c():
+    from deepsocflow.py.brevitas.simulation.sim import quant_lrelu
+
+    rows = _c_quant_lrelu_table()
+    assert len(rows) > 10000, "the dump looks truncated"
+
+    x = np.array([r[0] for r in rows], dtype=np.int64)
+    nzero = np.array([r[1] for r in rows], dtype=np.int64)
+    shift = np.array([r[2] for r in rows], dtype=np.int64)
+    pl_scale = np.array([r[3] for r in rows], dtype=np.int64)
+    x_bits = np.array([r[4] for r in rows], dtype=np.int64)
+    expected = np.array([r[5] for r in rows], dtype=np.int64)
+
+    # (nzero, shift, pl_scale, x_bits) are per-bundle scalar constants in the
+    # real pipeline, not per-element - quant_lrelu's signature assumes that,
+    # so group the dump by the distinct combinations actually swept rather
+    # than calling it once per element.
+    got = np.empty_like(expected)
+    combos = {tuple(row[1:5]) for row in rows}
+    for nz, sh, pl, xb in combos:
+        m = (nzero == nz) & (shift == sh) & (pl_scale == pl) & (x_bits == xb)
+        got[m] = quant_lrelu(x[m], nz, sh, pl, xb)
+
+    bad = np.flatnonzero(got != expected)
+    assert bad.size == 0, (
+        f"{bad.size} mismatches, first at x={x[bad[0]]} nzero={nzero[bad[0]]} "
+        f"shift={shift[bad[0]]} pl_scale={pl_scale[bad[0]]} x_bits={x_bits[bad[0]]}: "
+        f"C says {expected[bad[0]]}, python says {got[bad[0]]}")
+
+
+def _c_write_x_wide_table():
+    """Compiles and runs deepsocflow/test/c/write_x_wide_dump.c, returning its
+    rows. Pins write_x's X_BITS>8 direct-store branch's byte order against the
+    real compiled C, so dataflow.py::pack_words_into_bytes's bits>8 branch
+    can't silently disagree with it on endianness - both sides are "just" a
+    native int16 store, which is exactly the kind of thing that looks
+    obviously correct on whichever side you're staring at and is only wrong
+    relative to the other one.
+    """
+    import pathlib, shutil, subprocess, tempfile
+
+    src = pathlib.Path(__file__).resolve().parents[1] / 'c' / 'write_x_wide_dump.c'
+    cc = shutil.which('cc') or shutil.which('gcc')
+    if cc is None or not src.exists():
+        pytest.skip("no C compiler or write_x_wide_dump.c not present")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        exe = pathlib.Path(tmp) / 'write_x_wide_dump'
+        subprocess.run([cc, '-O2', '-o', str(exe), str(src)], check=True)
+        out = subprocess.run([str(exe)], check=True, capture_output=True, text=True).stdout
+    return [tuple(int(v) for v in line.split()) for line in out.splitlines()]
+
+
+def test_write_x_wide_matches_c():
+    from deepsocflow.py.dataflow import pack_words_into_bytes
+
+    rows = _c_write_x_wide_table()
+    assert len(rows) > 5, "the dump looks truncated"
+
+    values = np.array([r[0] for r in rows], dtype=np.int64)
+    expected_bytes = np.array([[r[1], r[2]] for r in rows], dtype=np.uint8)
+
+    got_bytes = pack_words_into_bytes(values, bits=16).reshape(-1, 2)
+
+    bad = np.flatnonzero((got_bytes != expected_bytes).any(axis=1))
+    assert bad.size == 0, (
+        f"{bad.size} mismatches, first at value={values[bad[0]]}: "
+        f"C bytes={expected_bytes[bad[0]].tolist()}, "
+        f"python bytes={got_bytes[bad[0]].tolist()}")
+
+
+def test_pack_words_into_bytes_rejects_non_byte_multiple_wide_bits():
+    from deepsocflow.py.dataflow import pack_words_into_bytes
+
+    with pytest.raises(AssertionError):
+        pack_words_into_bytes(np.array([1, 2, 3], dtype=np.int64), bits=12)
+
+
 def test_avgpool_uses_div_round_not_a_mean():
     # The engine sums the window and applies div_round; an ordinary mean disagrees
     # with it by up to 1 LSB, almost always on negative values. Pinning this stops

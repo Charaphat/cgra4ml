@@ -222,9 +222,14 @@ def reorder_x_q2e_conv(x, hw, r):  # x: input activation tensor, hw: Hardware co
         assert xp.shape == (r.XN, r.XL, r.XW, CM_p, (hw.ROWS+r.X_PAD))
 
         xp = xp.flatten()
-        words_per_byte = 8//hw.X_BITS
-        pad = words_per_byte-(xp.size%words_per_byte)
-        pad = 0 if pad == words_per_byte else pad
+        if hw.X_BITS <= 8:
+            words_per_byte = 8//hw.X_BITS
+            pad = words_per_byte-(xp.size%words_per_byte)
+            pad = 0 if pad == words_per_byte else pad
+        else:
+            # X_BITS>8: every word already occupies whole bytes (see
+            # pack_words_into_bytes's bits>8 branch) - nothing to round up to.
+            pad = 0
         xp = np.pad(xp, ((0,pad)))
 
         x_list += [xp]
@@ -276,6 +281,15 @@ def reorder_y_e2q_conv(y, hw, r):  # y: conv output tensor, hw: Hardware config,
 
 
 def pack_words_into_bytes (arr, bits):  # arr: flat array of quantized words, bits: bitwidth per word
+    if bits > 8:
+        # No packing to do - a word already spans whole bytes (mirrors the
+        # bias path's own int{8,16,32}->bytes conversion, rtl_export.py's
+        # `b.be.astype(type_d['np'][hw.B_BITS]).tobytes()`), unlike the <=8
+        # case below where several words share one byte.
+        assert bits % 8 == 0, f"Bits {bits} > 8 must be a whole number of bytes"
+        dtype = {16: np.int16}[bits]
+        return np.frombuffer(arr.astype(dtype).tobytes(), dtype=np.uint8)
+
     assert 8 % bits == 0, f"Bits {bits} should be factor of 8 for packing"
     w_words_per_byte = 8//bits
     arr = np.frombuffer(arr.astype(np.int8).tobytes(), dtype=np.uint8)

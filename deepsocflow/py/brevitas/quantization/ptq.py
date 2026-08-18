@@ -38,8 +38,36 @@ def _frac_bits(scale):
 	return round(-math.log2(scale))
 
 
+# type(act).__name__.lower() only works while every activation's name is one
+# word ("ReLU" -> "relu", "Identity" -> "identity"); "LeakyReLU" is two words
+# and a bare .lower() gives "leakyrelu", which matches nothing in sim.py's
+# SUPPORTED_ACTIVATIONS/act_params or adapter.py's act_params - both of which
+# have always expected 'leaky_relu' with the underscore. This went uncaught
+# because no bundle in this backend used LeakyReLU as a core or add
+# activation until StageK's post-add lrelu_post - it surfaced immediately as
+# an assertion naming the unrecognized activation 'leakyrelu'.
+_ACT_TYPE_NAMES = {'ReLU': 'relu', 'Identity': 'identity', 'LeakyReLU': 'leaky_relu'}
+
+
 def _act_type_name(act):
-	return type(act).__name__.replace("Quant", "").lower()
+	name = type(act).__name__.replace("Quant", "")
+	return _ACT_TYPE_NAMES.get(name, name.lower())
+
+
+def _negative_slope(act):
+	"""The real nn.LeakyReLU.negative_slope a QuantLeakyReLU wraps, or None for
+	any other activation type. brevitas buries the underlying torch module
+	several layers down (QuantNonLinearActMixin injects it as act_impl inside
+	the quant proxy, not as a plain submodule at the top level) - found by
+	walking named_modules() for whichever child actually carries the
+	attribute, rather than hardcoding the exact path, so this keeps working if
+	brevitas ever reorganizes the proxy's internals."""
+	if not isinstance(act, QuantLeakyReLU):
+		return None
+	for _, mod in act.named_modules():
+		if hasattr(mod, 'negative_slope'):
+			return float(mod.negative_slope)
+	raise AssertionError("QuantLeakyReLU has no negative_slope anywhere in its submodules")
 
 
 def _as_pair(v):
@@ -210,7 +238,7 @@ def _fold_batchnorm(layer, bn):
 	return fuse_conv_bn_eval(layer, bn)
 
 
-def _quantize_layer(layer, weight_bits=8, bias_bits=32, own_input_quant=True):
+def _quantize_layer(layer, weight_bits=8, bias_bits=32, act_bits=8, own_input_quant=True):
 	# Compute layers: plain torch type -> our xlayer quant equivalent.
 	LAYER_MAP = {
 		nn.Linear: QuantLinear,
@@ -231,20 +259,34 @@ def _quantize_layer(layer, weight_bits=8, bias_bits=32, own_input_quant=True):
 	# re-quantizing it - a single quantization point per bundle, matching
 	# qkeras's structure, instead of one after every activation AND one
 	# before every layer.
+	#
+	# input_bit_width matters only for the network's very first bundle (the
+	# only place own_input_quant is ever True) - every later bundle's input
+	# quantization is whatever the PRODUCING bundle's own activation already
+	# declared (act_bits, threaded through _quantize_activation below), not
+	# this one. Without it the first bundle's input silently stayed at
+	# Int8ActPerTensorFixedPoint's own default (8 bits) regardless of the
+	# caller's act_bits, which produces a NEGATIVE ca_shift once a later
+	# activation is declared wider (runtime.h's shift_round has no defined
+	# behavior for a negative shift count) - caught by StageL at act_bits=16,
+	# where the C-level output came back silently all-zero rather than
+	# raising, since it's a real hardware shift-by-negative, not a Python
+	# assertion.
 	input_quant = Int8ActPerTensorFixedPoint if own_input_quant else None
+	input_bit_width = act_bits if own_input_quant else None
 
 	if isinstance(layer, nn.Linear):
 		quant_layer = quant_cls(
 			layer.in_features, layer.out_features, bias=has_bias,
 			weight_quant=Int8WeightPerTensorFixedPoint, weight_bit_width=weight_bits,
-			input_quant=input_quant,
+			input_quant=input_quant, input_bit_width=input_bit_width,
 			bias_quant=bias_quant, bias_bit_width=bias_bits)
 	else:
 		kwargs = {name: getattr(layer, name) for name in _CONV_ATTRS}
 		quant_layer = quant_cls(
 			bias=has_bias,
 			weight_quant=Int8WeightPerTensorFixedPoint, weight_bit_width=weight_bits,
-			input_quant=input_quant,
+			input_quant=input_quant, input_bit_width=input_bit_width,
 			bias_quant=bias_quant, bias_bit_width=bias_bits, **kwargs)
 	quant_layer.load_state_dict(layer.state_dict(), strict=False)
 
@@ -253,7 +295,7 @@ def _quantize_layer(layer, weight_bits=8, bias_bits=32, own_input_quant=True):
 	return quant_layer
 
 
-def _quantize_activation(act, share_act_quant=None):
+def _quantize_activation(act, act_bits=8, share_act_quant=None):
 	# Activations: plain torch type -> (our xlayer quant equivalent, power-of-two scale
 	# act_quant matching its sign - Uint8 for ReLU's output, which is >= 0, Int8 for
 	# everything else).
@@ -306,9 +348,20 @@ def _quantize_activation(act, share_act_quant=None):
 	# fits the signed datapath every other tensor in this project uses (mirrors
 	# xlayers.py:31-33: "QKeras treats relu as unsigned, we have everything
 	# signed, so we reduce bitwidth" - an unsigned 8-bit value can reach 255,
-	# which silently wraps when packed into a signed 8-bit word).
+	# which silently wraps when packed into a signed 8-bit word). Generalizes
+	# the bit width this narrowing is relative to - it used to be hardcoded to
+	# 7 (=8-1), which was correct only for the 8-bit-activation default.
 	if act_quant is Uint8ActPerTensorFixedPoint:
-		kwargs["bit_width"] = 7
+		kwargs["bit_width"] = act_bits - 1
+	else:
+		kwargs["bit_width"] = act_bits
+
+	# QuantLeakyReLU forwards **kwargs straight to torch.nn.LeakyReLU
+	# (quantActivation.py) - without this, the slope asserted above never
+	# reaches the built module, and it silently falls back to
+	# nn.LeakyReLU's own default (0.01), not the caller's real slope.
+	if isinstance(act, nn.LeakyReLU):
+		kwargs["negative_slope"] = act.negative_slope
 
 	return quant_cls(**kwargs)
 
@@ -388,13 +441,30 @@ class quantized_model(nn.Module):
 	# so the topology is declared rather than inferred. Everything downstream
 	# consumes the exported JSON, so this can be replaced by real tracing later
 	# without touching anything else.
-	def __init__(self, net, weight_bits=8, bias_bits=32, layer_bits=None,
-	             residuals=None):
+	#
+	# branches: optional {consumer_attr: source_attr}, same shape as residuals but
+	# for a bundle's MAIN input instead of its residual-add input - declares that
+	# consumer_attr's compute layer runs on source_attr's bundle output rather than
+	# on the literal previous bundle's output (the default forward() otherwise
+	# assumes). This is what a ResNet-style downsample block needs: the block's
+	# input feeds a 1x1 shortcut conv AND a 3x3 main-path conv, both as MAIN
+	# input, not one main + one add. Every bundle positioned after the one it
+	# branches off of still defaults to "the literal previous bundle" unless it
+	# ALSO has its own branches entry - e.g. the bundle that follows a downsample
+	# conv in the flat child list typically needs its own
+	# branches={'that_bundle': 'the_conv3x3_before_downsample'} entry, since
+	# without it the downsample conv would otherwise become its (wrong) default
+	# predecessor. See rtl_export.py's buffer-tiling fix for why the engine can
+	# now route a bundle's output to two differently-tiled consumers at all.
+	def __init__(self, net, weight_bits=8, bias_bits=32, act_bits=8, layer_bits=None,
+	             residuals=None, branches=None):
 		super().__init__()
 		self.bundles = nn.ModuleList()
 		layer_bits = layer_bits or {}
 		residuals = residuals or {}
-		self.skip_source = {}   # consumer bundle index -> source bundle index
+		branches = branches or {}
+		self.skip_source = {}   # consumer bundle index -> source bundle index (x_add)
+		self.main_source = {}   # consumer bundle index -> source bundle index (main input)
 		_bundle_of_attr = {}    # float net attribute name -> bundle index
 
 		named_children = list(net.named_children())
@@ -436,6 +506,7 @@ class quantized_model(nn.Module):
 				layer,
 				weight_bits=overrides.get('weight_bits', weight_bits),
 				bias_bits=overrides.get('bias_bits', bias_bits),
+				act_bits=act_bits,
 				own_input_quant=(len(self.bundles) == 0))
 			if core is None:
 				raise ValueError(
@@ -445,6 +516,14 @@ class quantized_model(nn.Module):
 
 			ib = len(self.bundles)
 			_bundle_of_attr[name] = ib
+
+			branch_source_attr = branches.get(name)
+			if branch_source_attr is not None:
+				assert branch_source_attr in _bundle_of_attr, (
+					f"branch source '{branch_source_attr}' for '{name}' is not a compute "
+					f"layer seen earlier in the net; a branch's main input can only come "
+					f"from a bundle that has already been built")
+				self.main_source[ib] = _bundle_of_attr[branch_source_attr]
 
 			# A residual consumer must land its core activation on the SAME
 			# fractional grid as the bundle it adds, because the hardware adds the
@@ -473,7 +552,7 @@ class quantized_model(nn.Module):
 				share_act_quant = src_act.act_quant
 
 			quant_act = _quantize_activation(
-				children[i], share_act_quant=share_act_quant
+				children[i], act_bits=act_bits, share_act_quant=share_act_quant
 			) if i < len(children) else None
 			if quant_act is not None:
 				core.act = quant_act
@@ -482,7 +561,28 @@ class quantized_model(nn.Module):
 				assert source_attr is None, (
 					f"residual consumer '{name}' has no activation after it; the shared "
 					f"grid is established through the core activation")
-				core.act = QuantIdentity(act_quant=Int8ActPerTensorFixedPoint, return_quant_tensor=True)
+				core.act = QuantIdentity(act_quant=Int8ActPerTensorFixedPoint, bit_width=act_bits, return_quant_tensor=True)
+
+			# A residual consumer may declare a SECOND activation, applied to the
+			# SUM after the add rather than to the core's own output before it -
+			# runtime.h's aa_nzero/aa_shift/aa_pl_scale already run the full
+			# quant_lrelu family there (relu/leaky_relu/identity), exactly like
+			# the core slot; this was only ever a software choice not to expose
+			# it, not a hardware limit. Unlike core.act above, this one needs NO
+			# scale-sharing with the source - the add is already correct once its
+			# two operands match (core.act's sharing already guarantees that),
+			# and nothing downstream cares what grid the sum itself lands on
+			# beyond the usual single-quantization-point-per-bundle convention,
+			# so it gets its own independently-calibrated scale. Detected the
+			# same way any other activation is: whatever real nn.Module sits
+			# next in the float net; falls through to None (later defaulted to
+			# QuantIdentity) when there isn't one, so a plain residual add
+			# (StageF's shape) behaves exactly as before.
+			post_add_act = None
+			if source_attr is not None:
+				post_add_act = _quantize_activation(children[i], act_bits=act_bits) if i < len(children) else None
+				if post_add_act is not None:
+					i += 1
 
 			# Pool and flatten sit between the activation and the softmax, in the
 			# order runtime.h applies them (CORE ACT -> residual -> POOLING, then
@@ -511,14 +611,16 @@ class quantized_model(nn.Module):
 			if softmax:
 				i += 1
 
-			# The add activation requantizes the sum back onto the activation grid
-			# (the sum needs one more bit than either operand). It is a plain
-			# identity: runtime.h:452 hardwires quant_lrelu for this slot and
-			# Bundle_t has no aa_lut_idx, so a curved activation here is not
-			# expressible at all.
-			add_act = QuantIdentity(
-				act_quant=Int8ActPerTensorFixedPoint, return_quant_tensor=True
-			) if source_attr is not None else None
+			# The add activation requantizes the sum back onto the activation
+			# grid (the sum needs one more bit than either operand). Uses the
+			# real activation detected above (post_add_act) when the float
+			# model has one; otherwise the previous default of a plain identity
+			# requant - runtime.h:452's quant_lrelu covers both (a curved/LUT
+			# activation is still not expressible here: Bundle_t has no
+			# aa_lut_idx, only the shift+clip family).
+			add_act = (post_add_act if post_add_act is not None else QuantIdentity(
+				act_quant=Int8ActPerTensorFixedPoint, bit_width=act_bits, return_quant_tensor=True
+			)) if source_attr is not None else None
 
 			self.bundles.append(XBundle(core=core, pool=pool, flatten=flatten,
 			                            softmax=softmax, add_act=add_act,
@@ -540,12 +642,18 @@ class quantized_model(nn.Module):
 		reset_bundles()
 		# Outputs are kept per bundle rather than threaded through one variable,
 		# because a skip consumer needs an earlier bundle's output as well as its
-		# immediate predecessor's. XBundle.call already accepts x_add.
+		# immediate predecessor's, and a branches consumer needs a NON-immediate
+		# earlier bundle's output as its MAIN input. XBundle.call already accepts
+		# x_add; main_source picks which output feeds the call itself.
 		outs = []
+		prev_x = x   # the model's own input, default main source for bundle 0
 		for idx, bundle in enumerate(self.bundles):
 			src = self.skip_source.get(idx)
-			x = bundle(x, outs[src]) if src is not None else bundle(x)
+			main_idx = self.main_source.get(idx)
+			main_x = outs[main_idx] if main_idx is not None else prev_x
+			x = bundle(main_x, outs[src]) if src is not None else bundle(main_x)
 			outs.append(x)
+			prev_x = x
 		return x
 
 	# Runs PTQ calibration: forwards calibration_data through the model with
@@ -586,8 +694,11 @@ class quantized_model(nn.Module):
 				name = f"bundle{idx}"
 				core = bundle.core
 				src_ib = self.skip_source.get(idx)
+				main_idx = self.main_source.get(idx)
+				main_x = outs[main_idx] if main_idx is not None else x
+				input_name = f"bundle{main_idx}" if main_idx is not None else prev_name
 
-				quant_input = core.input_quant(x) if core.has_own_input_quant else x
+				quant_input = core.input_quant(main_x) if core.has_own_input_quant else main_x
 				quant_weight = core.quant_weight(quant_input)
 				quant_bias = core.bias_quant(core.bias, quant_input, quant_weight) if core.bias is not None else None
 
@@ -600,7 +711,7 @@ class quantized_model(nn.Module):
 
 				layer = {
 					"type": "linear" if hasattr(core, "in_features") else "conv",
-					"input": prev_name,
+					"input": input_name,
 					"input_bits": int(quant_input.bit_width.item()),
 					"input_signed": input_signed,
 					"input_frac": _frac_bits(quant_input.scale.item()),
@@ -647,10 +758,13 @@ class quantized_model(nn.Module):
 						"values_float": quant_bias.value.tolist(),
 					}
 
-				x = bundle(x, outs[src_ib]) if src_ib is not None else bundle(x)
+				x = bundle(main_x, outs[src_ib]) if src_ib is not None else bundle(main_x)
 				outs.append(x)  # advance to this bundle's real (post-act/softmax) output
 
 				layer["activation"] = _act_type_name(core.act)
+				act_slope = _negative_slope(core.act)
+				if act_slope is not None:
+					layer["negative_slope"] = act_slope
 				if core.act.act_quant.is_quant_enabled:
 					act_scale = core.act.act_quant.scale().item()
 					layer["act_bits"] = int(core.act.act_quant.bit_width().item())
@@ -676,6 +790,9 @@ class quantized_model(nn.Module):
 					layer["skip_from"] = f"bundle{src_ib}"
 					add_act = bundle.add.act
 					layer["add_activation"] = _act_type_name(add_act)
+					add_slope = _negative_slope(add_act)
+					if add_slope is not None:
+						layer["add_negative_slope"] = add_slope
 					if add_act.act_quant.is_quant_enabled:
 						add_scale = add_act.act_quant.scale().item()
 						layer["add_act_bits"] = int(add_act.act_quant.bit_width().item())

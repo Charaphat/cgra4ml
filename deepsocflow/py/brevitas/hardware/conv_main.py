@@ -18,7 +18,7 @@ BREV_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--stage', default='a', choices=list('abcdefghi'))
+    parser.add_argument('--stage', default='a', choices=list('abcdefghijklm'))
     # The legacy conv path has only ever been exercised at batch 1 (run/example.py),
     # and the XOR model never exercised it at all - export_bundle's dense branch
     # reshapes a batch into the height axis, so XN stays 1 there too. Keep this
@@ -29,7 +29,8 @@ def main():
     args = parser.parse_args()
 
     from deepsocflow.py.brevitas.conv import (
-        build_model, stage_data, prime_batchnorm, MODEL_DIR, STAGE_RESIDUALS)
+        build_model, stage_data, prime_batchnorm, MODEL_DIR,
+        STAGE_RESIDUALS, STAGE_BRANCHES, STAGE_ACT_BITS, STAGE_BITS_SUM)
     from deepsocflow.py.brevitas.hardware.hardware import Hardware
     from deepsocflow.py.brevitas.quantization.ptq import quantized_model
     from deepsocflow.py.brevitas.simulation.sim import FixedPointModel
@@ -53,8 +54,10 @@ def main():
     # The bias's frac is derived (input_frac + weight_frac) rather than chosen,
     # so narrowing this too far saturates every bias value silently - 16 leaves
     # real integer headroom at these scales.
-    qm = quantized_model(model, weight_bits=8, bias_bits=16,
-                         residuals=STAGE_RESIDUALS.get(args.stage))
+    act_bits = STAGE_ACT_BITS.get(args.stage, 8)
+    qm = quantized_model(model, weight_bits=8, bias_bits=16, act_bits=act_bits,
+                         residuals=STAGE_RESIDUALS.get(args.stage),
+                         branches=STAGE_BRANCHES.get(args.stage))
     qm.quantization(X)
     qm.eval()
 
@@ -134,7 +137,8 @@ def main():
     #                          (see CLAUDE.md's Known Issues).
     hw = Hardware(
         processing_elements=(8, 24),
-        bits_input=8, bits_weights=8, bits_bias=16, bits_sum=32,
+        bits_input=act_bits, bits_weights=8, bits_bias=16,
+        bits_sum=STAGE_BITS_SUM.get(args.stage, 32),
         ram_edges_depth=3584,
         axi_width=128,
         valid_prob=1, ready_prob=1,

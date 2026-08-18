@@ -43,14 +43,22 @@ def _conv2d_same(x, w):
     the extra pixel (if odd) going to the bottom/right - matches np.pad below.
     At the 1x1 kernel size the brevitas adapter actually produces today
     (dense-only, see CLAUDE.md's Known Issues on conv support), this reduces
-    to a per-pixel channel matmul with no padding at all."""
+    to a per-pixel channel matmul with no padding at all.
+
+    Accumulates in int64, not float32: x/w are already integer (quantized)
+    tensors, and float32's 24-bit mantissa stops being exact once
+    ACC_WIDTH = K_BITS + X_BITS + clog2(KH*KW*CM) exceeds 24 - which X_BITS=16
+    hits immediately for any real kernel (taps>1). int64 has no such ceiling
+    at the bit widths this project uses (Y_BITS caps ACC_WIDTH separately,
+    asserted at the call site)."""
     N, H, W, Ci = x.shape
     KH, KW, _, Co = w.shape
     pad_h, pad_w = KH - 1, KW - 1
     pad_top, pad_left = pad_h // 2, pad_w // 2
     pad_bottom, pad_right = pad_h - pad_top, pad_w - pad_left
-    xp = np.pad(x, ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right), (0, 0)))
-    out = np.zeros((N, H, W, Co), dtype=np.float32)
+    xp = np.pad(x.astype(np.int64), ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right), (0, 0)))
+    w = w.astype(np.int64)
+    out = np.zeros((N, H, W, Co), dtype=np.int64)
     for kh in range(KH):
         for kw in range(KW):
             out += np.einsum('nhwc,cd->nhwd', xp[:, kh:kh+H, kw:kw+W, :], w[kh, kw])
@@ -129,7 +137,7 @@ def export_bundle(bundle, hw, is_last):  # hw: Hardware config, is_last: True if
 
         wp = w_int[:,:, ic_left:ic_right, :]  # weight slice (w) for this pass (p)
         xp = x_int[:,:,:, ic_left:ic_right ]  # input slice (x) for this pass (p)
-        yp = _conv2d_same(xp.astype(np.float32), wp.astype(np.float32)).astype(np.int32)  # conv-sum (y) for this pass (p)
+        yp = _conv2d_same(xp, wp).astype(np.int32)  # conv-sum (y) for this pass (p)
         b.ye_exp_p += [reorder_y_q2e_conv(yp, hw, r)]
         ic_left = ic_right
     b.hw, b.r = hw, r
@@ -140,40 +148,101 @@ def _export_bundles(hw, x):
     and, for the brevitas backend, that each bundle's integer tensors are already
     computed (its call_int is a no-op). `x` is the input XTensor consumed by
     bundle 0's call_int; the brevitas backend passes None."""
-    add_buffer_map = []
-    out_buffer_map = []
 
+    # Phase 1: compute every bundle's own tensors and engine geometry (.r)
+    # first. The OUT-buffer grouping below needs to read ANY consumer's .r to
+    # know its tiling, not just the bundle that happens to sit at ib+1 - so
+    # every bundle's .r has to exist before allocation starts, rather than
+    # being interleaved with it one bundle at a time as before. get_runtime_
+    # params/create_headers (dataflow.py) take only a bundle's own core/pool/
+    # flatten/tensor shapes as input, so this split changes nothing for a
+    # single bundle's own numbers - only the ORDER buffer allocation can now
+    # see them in.
     for ib, b in enumerate(BUNDLES):
         print(f'-----------------ib:{ib}-----------------------')
         b.call_int(x if ib==0 else None, hw)
         b.export(hw, False)
 
+    def _tiling_key(consumer_ib):
+        """The engine tiling a bundle's MAIN consumer needs, as a plain tuple.
+        Two consumers only belong in the same output buffer when every one of
+        these matches - not just cm/cm_p0/x_pad, which can coincide while p/l/
+        w/n differ and would silently merge two consumers into one buffer
+        neither is correctly tiled for."""
+        r = BUNDLES[consumer_ib].r
+        return (r.XN, r.XL, r.XW, r.CP, r.CM, r.CM_0, r.X_PAD)
+
+    def _allocate(buffer_map, producer_ib, consumers):
+        """Find-or-append a free slot in buffer_map for `consumers` (sorted,
+        non-empty). Same free-list logic as before, just callable more than
+        once per producer so a bundle with two differently-tiled consumer
+        groups can get two buffers instead of one."""
+        for im in range(len(buffer_map)):
+            if buffer_map[im] is None:
+                buffer_map[im] = {'in': producer_ib, 'out': consumers}
+                return im
+        buffer_map.append({'in': producer_ib, 'out': consumers})
+        return len(buffer_map) - 1
+
+    def _free(buffer_map, ib):
+        """Free every slot whose last (highest-ib) consumer is `ib`."""
+        for im in range(len(buffer_map)):
+            buf = buffer_map[im]
+            if buf is not None and buf['out'][-1] == ib:
+                buffer_map[im] = None
+
+    add_buffer_map = []
+    out_buffer_map = []
+
+    for ib, b in enumerate(BUNDLES):
         '''
         OUTPUT BUFFER ALLOCATION
         '''
         print(f'input_out_map:{out_buffer_map}')
 
-        '''Find and assign a free buffer. If not, add new buffer'''
+        # Find and assign up to two free buffers - one per DISTINCT tiling
+        # among this bundle's main consumers (a ResNet downsample block's 1x1
+        # shortcut and 3x3 main path off the same tensor are the case this
+        # closes: same producer, two consumers, two different tilings, one
+        # buffer each). The common case - one consumer, or several consumers
+        # that happen to share a tiling - still gets exactly one buffer,
+        # unchanged from before.
         b.out_buffer_idx = -1
+        b.out_buffer_idx2 = -1
+        b.ib_out = -1
+        b.ib_out2 = -1
+        b.out_buffer_idx_for = {}   # consumer ib -> which of this bundle's (up to 2) buffers it reads
+
         next_ibs = sorted(list(b.next_ibs))  # next_ibs: bundle indices (ib) that consume this bundle's output
         if len(next_ibs) != 0:
-            for im in range(len(out_buffer_map)):  # im: index of a buffer slot in the map
-                if out_buffer_map[im] is None:
-                    out_buffer_map[im] = {'in':b.ib, 'out':next_ibs}
-                    b.out_buffer_idx = im
-                    break
-            else: #m if break is not hit
-                b.out_buffer_idx = len(out_buffer_map)
-                out_buffer_map += [{'in':b.ib, 'out':next_ibs}]
+            groups = []   # [{'key':..., 'members':[consumer_ib,...]}, ...], in first-seen order
+            for c in next_ibs:
+                key = _tiling_key(c)
+                for g in groups:
+                    if g['key'] == key:
+                        g['members'].append(c)
+                        break
+                else:
+                    groups.append({'key': key, 'members': [c]})
 
-        print('out_buffer_idx:', b.out_buffer_idx)
+            assert len(groups) <= 2, (
+                f"bundle {ib}: consumers {next_ibs} need {len(groups)} distinct "
+                f"output tilings {[g['key'] for g in groups]} - only up to 2 "
+                f"(one 'main' branch, one alternate) are supported")
+
+            for gi, g in enumerate(groups):
+                idx = _allocate(out_buffer_map, b.ib, g['members'])
+                for c in g['members']:
+                    b.out_buffer_idx_for[c] = idx
+                if gi == 0:
+                    b.out_buffer_idx, b.ib_out = idx, g['members'][0]
+                else:
+                    b.out_buffer_idx2, b.ib_out2 = idx, g['members'][0]
+
+        print('out_buffer_idx:', b.out_buffer_idx, 'out_buffer_idx2:', b.out_buffer_idx2)
 
         '''Free the buffers whose last destination is current bundle'''
-        for im in range(len(out_buffer_map)):
-            buf = out_buffer_map[im]
-            if buf is not None:
-                if buf['out'][-1] == b.ib:
-                    out_buffer_map[im] = None
+        _free(out_buffer_map, b.ib)
 
         print(f'out_buffer_map:{out_buffer_map}')
 
@@ -191,29 +260,36 @@ def _export_bundles(hw, x):
         # be ascending regardless of what the caller handed us.
         next_add_ibs = sorted(b.next_add_ibs)
         if len(next_add_ibs) != 0:
-            for im in range(len(add_buffer_map)):
-                if add_buffer_map[im] is None:
-                    add_buffer_map[im] = {'in':b.ib, 'out':next_add_ibs}
-                    b.add_out_buffer_idx = im
-                    break
-            else: #m if break is not hit
-                b.add_out_buffer_idx = len(add_buffer_map)
-                add_buffer_map += [{'in':b.ib, 'out':next_add_ibs}]
+            b.add_out_buffer_idx = _allocate(add_buffer_map, b.ib, next_add_ibs)
 
         print('add_out_buffer_idx:', b.add_out_buffer_idx)
 
         '''Free the buffers whose last destination is current bundle'''
-        for im in range(len(add_buffer_map)):
-            buf = add_buffer_map[im]
-            if buf is not None:
-                if buf['out'][-1] == b.ib:
-                    add_buffer_map[im] = None
+        _free(add_buffer_map, b.ib)
 
         print(f'add_buffer_map:{add_buffer_map}')
 
 
     d_perf = predict_model_performance(hw=hw)
     print(f"Predicted performance: {d_perf}")
+
+    def _consumer_size(rep_ib):
+        # Sizes an output buffer from ITS OWN representative consumer's
+        # transfer geometry - NOT from BUNDLES[ib+1], which used to be assumed
+        # regardless of whether ib+1 was even a real consumer of this bundle's
+        # output. For a bundle with one consumer group (every existing stage),
+        # rep_ib == ib+1 in a linear chain, so this reproduces the old numbers
+        # exactly; for a branching bundle, each group is sized from its own
+        # real consumer.
+        b_next    = BUNDLES[rep_ib]
+        o_wpt     = b_next.xe[-1].size    # output words-per-transfer, i.e. consumer's input (last pass)
+        o_wpt_p0  = b_next.xe[0].size     # output words-per-transfer, i.e. consumer's input (pass 0)
+        words = o_wpt_p0 + (b_next.r.CP-1)*o_wpt
+
+        o_bpt    = (hw.X_BITS*b_next.xe[-1].size)//8    # output bytes-per-transfer (last pass)
+        o_bpt_p0 = (hw.X_BITS*b_next.xe[0].size)//8  # output bytes-per-transfer (pass 0)
+        bytes_ = o_bpt_p0 + (b_next.r.CP-1)*o_bpt
+        return words, bytes_
 
     '''
     Write Runtime Headers
@@ -226,10 +302,18 @@ def _export_bundles(hw, x):
     # apart - it reads the same locals the ch.write(...) calls below use.
     bundles_json = []
 
+    # Count of bundles that got a second, differently-tiled output buffer.
+    # Guards every read of ib_out2/out_buffer_idx2/o_bytes2/o_words2 in
+    # runtime.h (`#if defined(N_BRANCH_BUNDLES) && N_BRANCH_BUNDLES > 0`) -
+    # the legacy qkeras exporter never emits this define at all, which is what
+    # makes those fields' C zero-default safe there. Same pattern as N_LUTS.
+    n_branch_bundles = sum(1 for b in BUNDLES if b.ib_out2 != -1)
+
     x_bytes_all = x_bytes = w_bytes = b_words = x_bytes_max = nhwc_words_max = o_bytes_max = o_words_max = 0
     with open (f'./config_fw.h', 'w') as ch:
 
         ch.write(f"#define N_BUNDLES {len(BUNDLES)}\n")
+        ch.write(f"#define N_BRANCH_BUNDLES {n_branch_bundles}\n")
         ch.write("\n")
         ch.write(f"Bundle_t bundles [N_BUNDLES] = {{\n")
 
@@ -247,15 +331,17 @@ def _export_bundles(hw, x):
                 o_words_b = b.o_int.size
                 o_bytes_b = o_words_b*4 # int or float
                 o_words = o_words_b
+                o_words_b2 = o_bytes_b2 = 0
             else:
-                b_next    = BUNDLES[ib+1]
-                o_wpt     = b_next.xe[-1].size    # output words-per-transfer, i.e. next bundle's input (last pass)
-                o_wpt_p0  = b_next.xe[0].size     # output words-per-transfer, i.e. next bundle's input (pass 0)
-                o_words_b = o_wpt_p0 + (b_next.r.CP-1)*o_wpt
-
-                o_bpt = (hw.X_BITS*b_next.xe[-1].size)//8    # output bytes-per-transfer (last pass)
-                o_bpt_p0 = (hw.X_BITS*b_next.xe[0].size)//8  # output bytes-per-transfer (pass 0)
-                o_bytes_b = o_bpt_p0 + (b_next.r.CP-1)*o_bpt
+                if b.ib_out != -1:
+                    o_words_b, o_bytes_b = _consumer_size(b.ib_out)
+                else:
+                    # No real main consumer (output only feeds a residual add,
+                    # or nowhere) - nothing tiled reads this buffer either way,
+                    # so fall back to the old ib+1 sizing rather than special-
+                    # casing a buffer nothing will use.
+                    o_words_b, o_bytes_b = _consumer_size(ib + 1)
+                o_words_b2, o_bytes_b2 = _consumer_size(b.ib_out2) if b.ib_out2 != -1 else (0, 0)
 
             xp_words  = b.r.XN * b.r.XL * b.r.XW * (hw.ROWS+b.r.X_PAD)  # input words per pass (p)
 
@@ -265,12 +351,12 @@ def _export_bundles(hw, x):
 
             x_bytes_max = max(x_bytes_max, x_bytes_b)
             nhwc_words_max = max(nhwc_words_max, nhwc_words_b)
-            o_bytes_max = max(o_bytes_max, o_bytes_b)
-            o_words_max = max(o_words_max, o_words_b)
+            o_bytes_max = max(o_bytes_max, o_bytes_b, o_bytes_b2)
+            o_words_max = max(o_words_max, o_words_b, o_words_b2)
             w_bytes += w_bytes_b
             x_bytes_all += x_bytes_b
 
-            ib_out = -1 if len(b.next_ibs) == 0 else sorted(b.next_ibs)[0]  # bundle index (ib) of consumer, or -1 if none
+            ib_out, ib_out2 = b.ib_out, b.ib_out2  # bundle index (ib) of each consumer group's representative, or -1
 
             if ib == 0:
                 x_bytes = (x_bpt_p0 + (b.r.CP-1)*x_bpt)
@@ -286,7 +372,11 @@ def _export_bundles(hw, x):
 
             add_out_buffer_idx = b.add_out_buffer_idx
             add_in_buffer_idx = BUNDLES[b.add.source_ib].add_out_buffer_idx if b.add is not None else -1  # buffer holding this bundle's residual/skip input
-            in_buffer_idx = BUNDLES[b.prev_ib].out_buffer_idx if b.prev_ib is not None else -1
+            # Which of the PRODUCER's (up to 2) output buffers THIS consumer
+            # reads - resolved per-consumer at allocation time
+            # (out_buffer_idx_for), not just "the producer's buffer" as if
+            # there could only ever be one.
+            in_buffer_idx = BUNDLES[b.prev_ib].out_buffer_idx_for[b.ib] if b.prev_ib is not None else -1
 
             if b.pool is None:
                 pool_type = 'POOL_NONE'
@@ -300,6 +390,7 @@ def _export_bundles(hw, x):
             ch.write(f"   {{.n={b.r.XN:<3}, .l={b.r.XL:<3}, .kw={b.r.KW:<3}, .coe={y_coe:<3}, .h={b.r.XH:<3}, .w={b.r.XW:<3}, .ci={b.r.CI:<4}, .co={b.r.CO:<4}, .w_kw2={b.r.XW-b.r.KW//2:<3}, .t={b.r.IT:<3}, .p={b.r.CP:<3}, .cm={b.r.CM:<3}, .cm_p0={b.r.CM_0:<3}, .on={b.r.ON:<3}, .oh={b.r.OH:<3}, .ow={b.r.OW:<3}, .oc={b.r.OC:<4}, .ch={b.r.CYH:<3}, .ph={b.r.PYH:<3}, .cw={b.r.CYW:<3}, .pw={b.r.PYW:<3}, .pkh={b.r.PKH:<3}, .psh={b.r.PSH:<3}, .pkw={b.r.PKW:<3}, .psw={b.r.PSW:<3}, ")
             ch.write(     f".xp_words={xp_words:<6}, .b_offset={b_words:<5}, .w_bpt={w_bpt:<5}, .w_bpt_p0={w_bpt_p0:<5}, .x_bpt={x_bpt:<8}, .x_bpt_p0={x_bpt_p0:<8}, .o_words={o_words_b:<8}, .o_bytes={o_bytes_b:<8}, ")
             ch.write(     f".ib_out={ib_out:<4}, .in_buffer_idx={in_buffer_idx:<3}, .out_buffer_idx={b.out_buffer_idx:<3}, .add_out_buffer_idx={add_out_buffer_idx:<2}, .add_in_buffer_idx={add_in_buffer_idx:<2}, ")
+            ch.write(     f".ib_out2={ib_out2:<4}, .out_buffer_idx2={b.out_buffer_idx2:<3}, .o_bytes2={o_bytes_b2:<8}, .o_words2={o_words_b2:<8}, ")
             ch.write(     f".is_bias={1*(b.core.b is not None):<3}, .is_flatten={1*(b.flatten is not None):<3}, .is_softmax={1*(b.softmax is not None):<3}, ")
             ch.write(     f".x_pad={b.r.X_PAD:<3}, .b_val_shift={b.core.bias_val_shift:<3}, .b_bias_shift={b.core.bias_b_shift:<3}, .ca_nzero={ca_nzero:<3}, .ca_shift={ca_shift:<3}, .ca_pl_scale={ca_pl_scale:<3}, .aa_nzero={aa_nzero:<3}, .aa_shift={aa_shift:<3}, .aa_pl_scale={aa_pl_scale:<3}, .pa_nzero={pa_nzero:<3}, .pa_shift={pa_shift:<3}, .pa_pl_scale={pa_pl_scale:<3}, .softmax_frac={b.softmax_frac:<3}, ")
             ch.write(     f".csh={b.r.CSH:<3}, .csh_shift={b.r.CSH_SHIFT:<3}, .psh_shift={b.r.PSH_SHIFT:<3}, .csw={b.r.CSW:<3}, .csw_shift={b.r.CSW_SHIFT:<3}, .psw_shift={b.r.PSW_SHIFT:<3}, .pool={pool_type:<10}, ")
@@ -322,6 +413,8 @@ def _export_bundles(hw, x):
                 'ib_out': int(ib_out), 'in_buffer_idx': int(in_buffer_idx),
                 'out_buffer_idx': int(b.out_buffer_idx), 'add_out_buffer_idx': int(add_out_buffer_idx),
                 'add_in_buffer_idx': int(add_in_buffer_idx),
+                'ib_out2': int(ib_out2), 'out_buffer_idx2': int(b.out_buffer_idx2),
+                'o_bytes2': int(o_bytes_b2), 'o_words2': int(o_words_b2),
                 'is_bias': 1*(b.core.b is not None), 'is_flatten': 1*(b.flatten is not None),
                 'is_softmax': 1*(b.softmax is not None),
                 'x_pad': int(b.r.X_PAD), 'b_val_shift': int(b.core.bias_val_shift),
@@ -366,6 +459,13 @@ def _export_bundles(hw, x):
         ch.write(f"#define Y_TYPE      int{hw.Y_OUT_BITS}_t\n")
         ch.write(f"#define B_TYPE      int{hw.B_BITS}_t\n")
         ch.write(f"#define O_TYPE      {out_type}\n")
+        # X_TYPE: element type for add_buffers/debug_tiled (runtime.h) - the
+        # only activation-carrying buffers not addressed through write_x's own
+        # byte-level packing, so they need a real width, not just a byte size.
+        # X_BITS<=8 always fits int8_t regardless of the exact bit count
+        # (mirrors out_buffers, which stays i8-typed and byte-addressed at any
+        # X_BITS<=8); X_BITS=16 needs int16_t.
+        ch.write(f"#define X_TYPE      int{8 if hw.X_BITS <= 8 else 16}_t\n")
         ch.write(f"#define B_WORDS     {b_words}\n")
         ch.write(f"#define AXI_WIDTH   {hw.AXI_WIDTH}\n")
         ch.write(f"#define CONFIG_BASEADDR 0x{hw.CONFIG_BASEADDR}\n")
@@ -373,6 +473,7 @@ def _export_bundles(hw, x):
 
         defines_json = {
             'N_BUNDLES': len(BUNDLES),
+            'N_BRANCH_BUNDLES': n_branch_bundles,
             'X_BITS_L2': int(np.log2(hw.X_BITS)),
             'W_BITS_L2': int(np.log2(hw.K_BITS)),
             'KH_MAX': hw.KH_MAX,
@@ -391,6 +492,7 @@ def _export_bundles(hw, x):
             'Y_TYPE_str': f'int{hw.Y_OUT_BITS}',
             'B_TYPE_str': f'int{hw.B_BITS}',
             'O_TYPE_str': 'float32' if out_type == 'float' else 'int32',
+            'X_TYPE_str': f'int{8 if hw.X_BITS <= 8 else 16}',
             'B_WORDS': b_words,
             'AXI_WIDTH': hw.AXI_WIDTH,
             'CONFIG_BASEADDR': str(hw.CONFIG_BASEADDR),
@@ -399,8 +501,19 @@ def _export_bundles(hw, x):
         with open('./config.json', 'w') as cj:
             json.dump({'defines': defines_json, 'bundles': bundles_json}, cj, indent=4)
 
-        mask_nums = [(2**hw.X_BITS-1) << (p*hw.X_BITS)  for p in range(8//hw.X_BITS)]
-        mask_nums = ~np.array(mask_nums, dtype=np.uint8)
+        # Only meaningful for X_BITS<=8 (write_x's masked read-modify-write
+        # path, runtime.h) - at X_BITS>8 a word never shares a byte with
+        # another word, so there's no mask table to build; range(8//hw.X_BITS)
+        # would silently become range(0) (empty) for X_BITS=16 rather than the
+        # divide-by-zero you'd expect, so this is spelled out explicitly
+        # rather than left to fall out of that division.
+        if hw.X_BITS <= 8:
+            mask_nums = [(2**hw.X_BITS-1) << (p*hw.X_BITS)  for p in range(8//hw.X_BITS)]
+            mask_nums = ~np.array(mask_nums, dtype=np.uint8)
+        else:
+            mask_nums = [0]  # unused (write_x's X_BITS>8 branch never reads this) -
+                              # a placeholder, not `[]`, since an empty C array
+                              # initializer isn't valid outside GNU-extension mode.
         ch.write(f"static const uint8_t X_POSITION_INVERTED_MASKS [] = {{ {', '.join([str(n) for n in mask_nums])} }};\n")
 
         '''
@@ -519,19 +632,55 @@ def verify_inference(model, hw, SIM, SIM_PATH='', TRACE=False):
                 y_tiled_sim = np.loadtxt(f"{hw.DATA_DIR}/{b.ib}_y_tiled_sim.txt", np.float32).reshape(y_tiled_exp.shape)/2**17
                 error = np.sum(np.abs(y_tiled_sim-y_tiled_exp))
                 assert error == 0, f"Error={error}, for y_tiled_sim at {b.ib=}"
-        else:
-            y_tiled_exp = np.concatenate([a.flatten() for a in BUNDLES[ib+1].xe])
+        elif b.ib_out != -1 and b.ib_out2 == -1:
+            # Skipped for a branching bundle (b.ib_out2 != -1): mp->debug_tiled
+            # is one shared array, and both branches write into it using their
+            # OWN independent tiling - there is no single "the" consumer layout
+            # for this check to compare against, and the two branches' writes
+            # can overlap and overwrite each other in it. That is a debug-only
+            # dump problem, not a correctness one: the packed-output check right
+            # below reads the REAL per-branch production buffers instead
+            # (separate files per branch), and is what this bundle's
+            # correctness actually rests on.
+            #
+            # Also skipped when there is no main consumer at all (b.ib_out==-1,
+            # output only feeds a residual add): tile_write's early return means
+            # nothing tiled was ever written for this bundle, so there is
+            # nothing meaningful in mp->debug_tiled to compare - the pre-fix
+            # code's literal `ib+1` fallback used to compare against whatever
+            # bundle happened to sit next regardless of whether it was a real
+            # consumer, which is exactly as meaningless; StageJ's conv_shortcut
+            # (an add-only producer) is the first topology in this repo to
+            # exercise that shape at all.
+            y_tiled_exp = np.concatenate([a.flatten() for a in BUNDLES[b.ib_out].xe])
             y_tiled_sim = np.loadtxt(f"{hw.DATA_DIR}/{b.ib}_y_tiled_sim.txt", np.float32).reshape(y_tiled_exp.shape)
             error = np.sum(np.abs(y_tiled_sim-y_tiled_exp))
             assert error == 0, f"Error={error}, for y_tiled_sim at {b.ib=}"
+        else:
+            error = 0  # no main consumer and/or branching bundle: nothing meaningful for this check to compare
 
-        ''' Verify packed output'''
-        if ib != len(BUNDLES)-1 and len(b.next_ibs) != 0:
-            with open(f'{hw.DATA_DIR}/{ib}_y_packed_sim.bin', 'rb') as f_sim, open(f'{hw.DATA_DIR}/{ib+1}_x_sim.bin', 'rb') as f_exp:
+        ''' Verify packed output - the REAL production buffer(s), one check per
+        branch. This is the authoritative tiling-correctness signal (unlike the
+        debug-only check above, it reads what the firmware actually wrote and
+        what the next bundle actually consumes). '''
+        def _check_packed(suffix, rep_ib):
+            with open(f'{hw.DATA_DIR}/{ib}_y_packed_sim{suffix}.bin', 'rb') as f_sim, \
+                 open(f'{hw.DATA_DIR}/{rep_ib}_x_sim.bin', 'rb') as f_exp:
                 y_packed_sim = np.frombuffer(f_sim.read(), dtype=np.uint8)
                 y_packed_exp = np.frombuffer(f_exp.read(), dtype=np.uint8)
-            diff  = y_packed_sim-y_packed_exp
-            error = np.sum(np.abs(diff))
-            assert error == 0, f"Error={error}, for y_packed_sim at {b.ib=}, y_packed_sim=\n{y_packed_sim[:100]} \n y_packed_exp=\n{y_packed_exp[:100]}\n, diff=\n{diff.tolist()}\n  y_packed_sim=\n{y_packed_sim.tolist()} \n y_packed_exp=\n{y_packed_exp.tolist()}\n"
+            diff = y_packed_sim - y_packed_exp
+            err = np.sum(np.abs(diff))
+            assert err == 0, (
+                f"Error={err}, for y_packed_sim{suffix} at {b.ib=} (consumer "
+                f"{rep_ib}), y_packed_sim=\n{y_packed_sim[:100]} \n "
+                f"y_packed_exp=\n{y_packed_exp[:100]}\n, diff=\n{diff.tolist()}\n "
+                f" y_packed_sim=\n{y_packed_sim.tolist()} \n "
+                f"y_packed_exp=\n{y_packed_exp.tolist()}\n")
+            return err
+
+        if ib != len(BUNDLES)-1 and b.ib_out != -1:
+            error = _check_packed('', b.ib_out)
+        if ib != len(BUNDLES)-1 and b.ib_out2 != -1:
+            _check_packed('2', b.ib_out2)
 
         print(f"Bundle {b.ib}, Error: {error}. Passed")

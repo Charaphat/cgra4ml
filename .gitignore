@@ -30,6 +30,10 @@ run/reference_qkeras_xor/
 # at the worktree root.
 deepsocflow/py/brevitas/letter-recognition.data
 deepsocflow/py/brevitas/airfoil_self_noise.dat
+deepsocflow/py/brevitas/train-images-idx3-ubyte.gz
+deepsocflow/py/brevitas/train-labels-idx1-ubyte.gz
+deepsocflow/py/brevitas/t10k-images-idx3-ubyte.gz
+deepsocflow/py/brevitas/t10k-labels-idx1-ubyte.gz
 deepsocflow/py/brevitas/config_fw.h
 deepsocflow/py/brevitas/config_hw.svh
 deepsocflow/py/brevitas/config_hw.tcl
@@ -49,6 +53,7 @@ deepsocflow/py/brevitas/vectors_*/
 deepsocflow/py/brevitas/model/conv_*.json
 deepsocflow/py/brevitas/model/conv.pt
 deepsocflow/py/brevitas/model/conv.onnx
+deepsocflow/py/brevitas/model/fashion_cnn.pt
 
 # Same generated set again, at the worktree root: the exporters write
 # config_fw.h and friends into the CURRENT WORKING DIRECTORY, so running any

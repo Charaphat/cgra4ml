@@ -28,6 +28,24 @@ typedef const struct {
   const u16  n, l, kw, coe, h, w, ci, co, w_kw2, t, p, cm, cm_p0, on, oh, ow, oc, ch, ph, cw, pw, pkh, psh, pkw, psw;
   const i32  xp_words, b_offset, w_bpt, w_bpt_p0, x_bpt, x_bpt_p0, o_words, o_bytes;
   const i8   ib_out, in_buffer_idx, out_buffer_idx, add_out_buffer_idx, add_in_buffer_idx;
+  // Second MAIN-input consumer, for a bundle whose output feeds two downstream
+  // bundles that need different engine tiling (e.g. a ResNet downsample block's
+  // 1x1 shortcut and 3x3 main path off the same tensor) - NOT the residual/skip
+  // "add" path above, which is untiled and already handles any number of
+  // consumers safely. ib_out2/out_buffer_idx2 are -1/unused unless the exporter
+  // actually needed a second tiling; o_bytes2/o_words2 size and bound-check that
+  // second buffer independently of o_bytes/o_words above.
+  //
+  // Same designated-initializer trap as ca_lut_idx below: the legacy qkeras
+  // exporter (deepsocflow/py/xmodel.py) does not emit these, so its
+  // initializers leave them at C's default 0 - which would read as "bundle 0"
+  // rather than "none". Safe because that exporter also never emits
+  // N_BRANCH_BUNDLES, so the `#if defined(N_BRANCH_BUNDLES) && N_BRANCH_BUNDLES
+  // > 0` guard around every read of these fields compiles the second-branch
+  // write out entirely for legacy-backend builds. Keep the guard if you touch
+  // this.
+  const i8   ib_out2, out_buffer_idx2;
+  const i32  o_bytes2, o_words2;
   const i8   is_bias, is_pool, is_flatten, is_softmax;
   const i8   x_pad, b_val_shift, b_bias_shift, ca_nzero, ca_shift, ca_pl_scale, aa_nzero, aa_shift, aa_pl_scale, pa_nzero, pa_shift, pa_pl_scale, softmax_frac;
   // Value-LUT activation (deepsocflow/py/brevitas/lut.py). ca_lut_idx indexes
@@ -50,8 +68,18 @@ typedef enum {POOL_NONE, POOL_MAX, POOL_AVG} Pool_t;
 
 #define f32__ O_TYPE
 #define X_BITS            (1 << X_BITS_L2)
-#define X_WORDS_PER_BYTE  (8 / X_BITS)
-#define X_BITS_MASK       ((1 << X_BITS) -1)
+// X_BITS<=8: several words packed into one byte, addressed via a masked
+// read-modify-write (write_x's X_BITS<=8 branch). X_BITS>8 (16 only, for
+// now): the opposite direction - each word spans multiple whole bytes, so
+// there is no packing to do, only a direct store (write_x's #else branch).
+// X_WORDS_PER_BYTE/X_BITS_MASK are meaningless (and divide-by-zero) once
+// X_BITS>8, so they stay guarded rather than merely redefined.
+#if X_BITS <= 8
+  #define X_WORDS_PER_BYTE  (8 / X_BITS)
+  #define X_BITS_MASK       ((1 << X_BITS) -1)
+#else
+  #define X_BYTES_PER_WORD  (X_BITS / 8)
+#endif
 #ifdef SIM
   #define XDEBUG
   void usleep(int x) {}
@@ -70,10 +98,10 @@ typedef struct {
   i8     out_buffers    [N_OUT_BUF   ][O_BYTES_MAX ];
   
 #ifdef XDEBUG
-  int8_t  debug_tiled    [O_WORDS_MAX ];
+  X_TYPE  debug_tiled    [O_WORDS_MAX ];
   int32_t debug_nhwc     [NHWC_WORDS  ];
 #endif
-  int8_t  add_buffers    [N_ADD_BUF   ][NHWC_WORDS  ]; // should be last, since N_ADD_BUF can be empty
+  X_TYPE  add_buffers    [N_ADD_BUF   ][NHWC_WORDS  ]; // should be last, since N_ADD_BUF can be empty
 } Memory_st;
 
 #include "fb_fw_wrap.h"
@@ -147,6 +175,10 @@ static inline void write_flush_u8(u8*restrict addr, u8 val) {
   *addr = val; // Leave flushing to the end of bundle
 }
 
+static inline void write_flush_i16(i16*restrict addr, i16 val) {
+  *addr = val; // Leave flushing to the end of bundle
+}
+
 #define flatten_nhwc(in,ih,iw,ic, N,H,W,C, optional_debug_info,...)\
   ((in*H + ih)*W + iw)*C + ic;\
   assert_printf (in, <, N, optional_debug_info,__VA_ARGS__); assert_printf (ih, <, H, optional_debug_info,__VA_ARGS__); assert_printf (iw, <, W, optional_debug_info,__VA_ARGS__); assert_printf (ic, <, C, optional_debug_info,__VA_ARGS__); assert_printf ((((in*H + ih)*W + iw)*C + ic), <, NHWC_WORDS, optional_debug_info,__VA_ARGS__);
@@ -185,7 +217,7 @@ static inline i32 quant_lut(i32 x, i8 shift, i8 in_bits, const i8 *restrict lut)
 }
 
 
-static inline void write_x(i8 val, i8 *restrict p_out_buffer, Memory_st *restrict mp, i32 ib, i32 ixp, i32 ixn, i32 ixl, i32 ixw, i32 ixcm, i32 ixr, Bundle_t *restrict pb_out, i32 xcm) {
+static inline void write_x(i32 val, i8 *restrict p_out_buffer, i32 o_bytes_bound, Memory_st *restrict mp, i32 ib, i32 ixp, i32 ixn, i32 ixl, i32 ixw, i32 ixcm, i32 ixr, Bundle_t *restrict pb_out, i32 xcm) {
 
   #define WRITEX_DEBUG_INFO "--- ib:%d ixp:%d ixn:%d ixl:%d ixw:%d ixcm:%d ixr:%d xcm :%d \n",ib,ixp,ixn,ixl,ixw,ixcm,ixr,xcm
   assert_printf (ixr , <, PE_ROWS+pb_out->x_pad, "write_x", WRITEX_DEBUG_INFO);
@@ -200,21 +232,81 @@ static inline void write_x(i8 val, i8 *restrict p_out_buffer, Memory_st *restric
   i32 flat_index     = p_offset + flat_index_n2r;
 
 #ifdef XDEBUG
-  mp->debug_tiled[flat_index] = val;
+  mp->debug_tiled[flat_index] = (X_TYPE)val;
 #endif
 
+#if X_BITS <= 8
   // Pack bits and store
   idiv_t packed_idx = idiv(flat_index, X_WORDS_PER_BYTE);
-  assert_printf (packed_idx.quot , <, bundles[ib].o_bytes, "write_x", WRITEX_DEBUG_INFO);
+  // Bound is the buffer THIS write actually targets (o_bytes_bound, passed in
+  // by the caller) - NOT always bundles[ib].o_bytes. A branching bundle's
+  // second buffer is sized by o_bytes2, which can be larger than o_bytes;
+  // checking every write against the primary bundle's o_bytes regardless of
+  // which buffer it targets false-triggers this assert on the second branch
+  // whenever its buffer is the larger of the two.
+  assert_printf (packed_idx.quot , <, o_bytes_bound, "write_x", WRITEX_DEBUG_INFO);
 
   u8 packed_val      = ((u8)val & X_BITS_MASK) << (packed_idx.rem * X_BITS);
   u8 mem_val         = p_out_buffer[packed_idx.quot];
   u8 mem_val_cleaned = X_POSITION_INVERTED_MASKS[packed_idx.rem] & mem_val;
   write_flush_u8((u8*)(p_out_buffer + packed_idx.quot), mem_val_cleaned | packed_val);
+#else
+  // X_BITS>8 (16): each word occupies X_BYTES_PER_WORD whole bytes - a direct
+  // store, no packing/masking, since a word never shares a byte with another
+  // word (unlike the X_BITS<=8 branch above).
+  i32 byte_idx = flat_index * X_BYTES_PER_WORD;
+  assert_printf (byte_idx + X_BYTES_PER_WORD, <=, o_bytes_bound, "write_x", WRITEX_DEBUG_INFO);
+  write_flush_i16((i16*)(p_out_buffer + byte_idx), (i16)val);
+#endif
 }
 
 
-static inline void tile_write( i32 out_val, i8 *restrict p_out_buffer, i32 ib, Bundle_t *restrict pb, Memory_st *restrict mp, i32 i_yn, i32 i_yh, i32 i_yw, i32 i_yc, i32 yn, i32 yh, i32 yw, i32 yc ) {
+// Tiles and writes out_val (plus any x_pad row padding) into ONE consumer's
+// output buffer, at that consumer's own engine geometry (pb_out). Split out of
+// tile_write so a bundle whose output branches to two differently-tiled
+// consumers can call this once per consumer without one call's internal
+// out_val=0 (row-padding bookkeeping, see below) leaking into the other -
+// out_val is taken BY VALUE, so each call gets its own copy to mutate.
+// o_bytes_bound is THIS buffer's own size (o_bytes for the primary branch,
+// o_bytes2 for the second) - see write_x's comment on why it can't be
+// re-derived from bundles[ib] internally.
+static inline void write_tiled_branch(i32 out_val, i8 *restrict p_out_buffer, i32 o_bytes_bound, i32 ib,
+    Bundle_t *restrict pb_out, Memory_st *restrict mp,
+    i32 i_yn, i32 i_yh, i32 i_yw, i32 i_yc, i32 yh) {
+
+  // ------ TILING: Calculate X coordinates ------
+  // y [n,h,w,c] -> x[p, n, l, w,cmp, r+pad]
+
+  i8 yp_first  = i_yc < pb_out->cm_p0;
+
+  idiv_t div_oh  = idiv(i_yh, PE_ROWS);
+  i32   i_yr    = div_oh.rem;
+  i32   i_yl    = div_oh.quot;
+
+  idiv_t div_oc    = idiv(i_yc-pb_out->cm_p0, pb_out->cm);
+  i32   i_yp      = yp_first ? 0             : div_oc.quot + 1;
+  i32   i_ycm     = yp_first ? i_yc          : div_oc.rem;
+  i32   ycm       = yp_first ? pb_out->cm_p0 : pb_out->cm  ;
+
+  // ------ STORE FOR NEXT BUNDLE  ------
+  // Other bundles: pad & save as tiled
+  i32 yr_sweep = i_yh==yh-1 ? PE_ROWS : i_yr + 1;
+
+  for (i32 i_yr_dest = i_yr; i_yr_dest < yr_sweep; i_yr_dest++) {
+    write_x(out_val, p_out_buffer, o_bytes_bound, mp, ib, i_yp, i_yn, i_yl, i_yw, i_ycm, i_yr_dest,   pb_out, ycm);
+
+    // --- PADDING: the [bottom x_pad rows of previous block (l-1)] with [first x_pad rows of this block (l)]
+    if (i_yr_dest < pb_out->x_pad) {
+      i32 pad_val = (i_yl == 0) ? 0         : out_val;
+      i32 dest_yl = (i_yl == 0) ? pb_out->l-1 : i_yl-1;
+      write_x(pad_val, p_out_buffer, o_bytes_bound, mp, ib, i_yp, i_yn, dest_yl, i_yw, i_ycm, i_yr_dest+PE_ROWS,   pb_out, ycm);
+    }
+    out_val = 0;
+  }
+}
+
+
+static inline void tile_write( i32 out_val, i8 *restrict p_out_buffer, i8 *restrict p_out_buffer2, i32 ib, Bundle_t *restrict pb, Memory_st *restrict mp, i32 i_yn, i32 i_yh, i32 i_yw, i32 i_yc, i32 yn, i32 yh, i32 yw, i32 yc ) {
 
   // ------ FLATTEN ------
   if (pb->is_flatten) {
@@ -242,46 +334,28 @@ static inline void tile_write( i32 out_val, i8 *restrict p_out_buffer, i32 ib, B
 
   // Store for residual add
   if (pb->add_out_buffer_idx != -1)
-    mp->add_buffers[pb->add_out_buffer_idx][iy_nhwc] = (i8)out_val;
+    mp->add_buffers[pb->add_out_buffer_idx][iy_nhwc] = (X_TYPE)out_val;
 
-  // If output only goes to residual add, early return
-  Bundle_t*restrict pb_out;
+  // If output goes to no MAIN consumer at all (only residual add, or
+  // nothing), early return. Guarded exactly like the write below: a
+  // legacy-exporter build never emits N_BRANCH_BUNDLES, so it never
+  // references ib_out2 at all here, not even in a condition that would
+  // happen to be harmless if it did - same rigor as the ca_lut_idx guard.
+#if defined(N_BRANCH_BUNDLES) && N_BRANCH_BUNDLES > 0
+  if (pb->ib_out == -1 && pb->ib_out2 == -1)
+    return;
+#else
   if (pb->ib_out == -1)
     return;
-  else
-    pb_out = &bundles[pb->ib_out];
-    
+#endif
 
-  // ------ TILING: Calculate X coordinates ------
-  // y [n,h,w,c] -> x[p, n, l, w,cmp, r+pad]
+  if (pb->ib_out != -1)
+    write_tiled_branch(out_val, p_out_buffer, pb->o_bytes, ib, &bundles[pb->ib_out], mp, i_yn, i_yh, i_yw, i_yc, yh);
 
-  i8 yp_first  = i_yc < pb_out->cm_p0;
-
-  idiv_t div_oh  = idiv(i_yh, PE_ROWS);
-  i32   i_yr    = div_oh.rem;
-  i32   i_yl    = div_oh.quot;
-
-  idiv_t div_oc    = idiv(i_yc-pb_out->cm_p0, pb_out->cm);
-  i32   i_yp      = yp_first ? 0             : div_oc.quot + 1;
-  i32   i_ycm     = yp_first ? i_yc          : div_oc.rem;
-  i32   ycm       = yp_first ? pb_out->cm_p0 : pb_out->cm  ;
-
-  // ------ STORE FOR NEXT BUNDLE  ------
-  // Other bundles: pad & save as tiled
-  i32 yr_sweep = i_yh==yh-1 ? PE_ROWS : i_yr + 1;
-
-  for (i32 i_yr_dest = i_yr; i_yr_dest < yr_sweep; i_yr_dest++) {
-    write_x(out_val, p_out_buffer, mp, ib, i_yp, i_yn, i_yl, i_yw, i_ycm, i_yr_dest,   pb_out, ycm);
-
-    // --- PADDING: the [bottom x_pad rows of previous block (l-1)] with [first x_pad rows of this block (l)]
-    if (i_yr_dest < pb_out->x_pad) {
-      i32 pad_val = (i_yl == 0) ? 0         : out_val;
-      i32 dest_yl = (i_yl == 0) ? pb_out->l-1 : i_yl-1;
-      write_x(pad_val, p_out_buffer, mp, ib, i_yp, i_yn, dest_yl, i_yw, i_ycm, i_yr_dest+PE_ROWS,   pb_out, ycm);
-    }
-    out_val = 0;
-  }
-  
+#if defined(N_BRANCH_BUNDLES) && N_BRANCH_BUNDLES > 0
+  if (pb->ib_out2 != -1)
+    write_tiled_branch(out_val, p_out_buffer2, pb->o_bytes2, ib, &bundles[pb->ib_out2], mp, i_yn, i_yh, i_yw, i_yc, yh);
+#endif
 }
 
 extern EXT_C void run(Memory_st *restrict mp) {
@@ -290,6 +364,7 @@ extern EXT_C void run(Memory_st *restrict mp) {
   static i32 it_bias=0, w_last, o_bpt;
   static i32 ib=0, ip=0, it=0, in=0, il=0, iw_kw2=0;
   static i8 *restrict p_out_buffer = 0;
+  static i8 *restrict p_out_buffer2 = 0;  // second branch's buffer; unused unless N_BRANCH_BUNDLES>0
 
   i32   iy_nhwc;
   idiv_t div_ch, div_cw, div_ixh, div_ixw;
@@ -308,6 +383,7 @@ extern EXT_C void run(Memory_st *restrict mp) {
 
     pb = &bundles[ib];
     p_out_buffer = (i8*)&(mp->out_buffers[pb->out_buffer_idx]);
+    p_out_buffer2 = (i8*)&(mp->out_buffers[pb->out_buffer_idx2]);
 
     for (ip = 0; ip < pb->p; ip++) {
       for (it = 0; it < pb->t; it++) {
@@ -481,7 +557,7 @@ extern EXT_C void run(Memory_st *restrict mp) {
                     // ------ MAX/AVG POOL ---
 
                     if (pb->pool == POOL_NONE) {
-                      tile_write(out_val, p_out_buffer, ib, pb, mp, i_yn, i_yh, i_yw, i_yc, yn, yh, yw, yc);
+                      tile_write(out_val, p_out_buffer, p_out_buffer2, ib, pb, mp, i_yn, i_yh, i_yw, i_yc, yn, yh, yw, yc);
                       goto PROCESS_AND_STORE_DONE;
                     }
 
@@ -537,7 +613,7 @@ extern EXT_C void run(Memory_st *restrict mp) {
                           out_val = quant_lrelu(out_val, pb->pa_nzero, pb->pa_shift, pb->pa_pl_scale);
                         }
 
-                        tile_write(result, p_out_buffer, ib, pb, mp,   i_yn, ixh, ixw, i_yc,  yn, pb->ph, pb->pw, yc); // Write
+                        tile_write(result, p_out_buffer, p_out_buffer2, ib, pb, mp,   i_yn, ixh, ixw, i_yc,  yn, pb->ph, pb->pw, yc); // Write
                       }
                     }
                     yh = pb->ph;
@@ -591,8 +667,24 @@ PROCESS_AND_STORE_DONE:
       fwrite(p_out_buffer, 1, pb->o_bytes, fp_packed);
       fclose(fp_packed);
     }
+#if defined(N_BRANCH_BUNDLES) && N_BRANCH_BUNDLES > 0
+    // Second branch's own packed dump, so its tiling can be verified
+    // independently of whichever bundle happens to sit at ib+1 - see
+    // verify_inference's matching read in rtl_export.py.
+    if (ib != N_BUNDLES-1 && pb->ib_out2 != -1){
+      char f_path_packed2 [1000];
+      sprintf(f_path_packed2, "%s/%0d_y_packed_sim2.bin", DATA_DIR, ib);
+      FILE *fp_packed2 = fopen(f_path_packed2, "wb");
+      fwrite(p_out_buffer2, 1, pb->o_bytes2, fp_packed2);
+      fclose(fp_packed2);
+    }
+#endif
 #endif
   flush_cache(p_out_buffer, pb->o_bytes);
+#if defined(N_BRANCH_BUNDLES) && N_BRANCH_BUNDLES > 0
+  if (pb->ib_out2 != -1)
+    flush_cache(p_out_buffer2, pb->o_bytes2);
+#endif
   fb_write_reg32(p_config + A_BUNDLE_DONE, 1);
   } // ib
   debug_printf("done all bundles!!\n");

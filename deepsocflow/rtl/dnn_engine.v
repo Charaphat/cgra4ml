@@ -63,14 +63,37 @@ module dnn_engine #(
   wire [AXI_WIDTH /X_BITS-1:0]  s_axis_pixels_tkeep_words;
   wire [AXI_WIDTH/K_BITS-1:0]  s_axis_weights_tkeep_words;
 
+  // X_BITS<=8: multiple words share one tkeep byte-bit (fan-out, ix/(8/X_BITS)).
+  // X_BITS>8 (16 only, for now - see hardware.py's bits_input assert): a word
+  // spans several tkeep byte-bits, so its own tkeep must be the AND-reduction
+  // of those bytes' tkeep bits instead (a word is valid only if every byte it's
+  // made of is valid) - 8/X_BITS would be an integer-division-by-zero at
+  // elaboration if written the X_BITS<=8 way for X_BITS=16, so this needs a
+  // real second branch, not just a parameter substitution.
   genvar ik, ix;
   generate
-    for (ix=0; ix<AXI_WIDTH/X_BITS; ix=ix+1) begin : px_keep
-      assign s_axis_pixels_tkeep_words[ix] = s_axis_pixels_tkeep[ix/(8/X_BITS)];
+    if (X_BITS <= 8) begin : px_keep_narrow
+      for (ix=0; ix<AXI_WIDTH/X_BITS; ix=ix+1) begin : px_keep
+        assign s_axis_pixels_tkeep_words[ix] = s_axis_pixels_tkeep[ix/(8/X_BITS)];
+      end
+    end else begin : px_keep_wide
+      for (ix=0; ix<AXI_WIDTH/X_BITS; ix=ix+1) begin : px_keep
+        assign s_axis_pixels_tkeep_words[ix] = &s_axis_pixels_tkeep[ix*(X_BITS/8) +: (X_BITS/8)];
+      end
     end
 
-    for (ik=0; ik<AXI_WIDTH/K_BITS; ik=ik+1) begin : wt_keep
-      assign s_axis_weights_tkeep_words[ik] = s_axis_weights_tkeep[ik/(8/K_BITS)];
+    // K_BITS stays in [1,2,4,8] for now (weight-side widening is out of scope
+    // here), so px_keep_wide's mirror below is dead code today - kept
+    // symmetric so a future K_BITS widening doesn't have to rediscover this
+    // same division-by-zero bug.
+    if (K_BITS <= 8) begin : wt_keep_narrow
+      for (ik=0; ik<AXI_WIDTH/K_BITS; ik=ik+1) begin : wt_keep
+        assign s_axis_weights_tkeep_words[ik] = s_axis_weights_tkeep[ik/(8/K_BITS)];
+      end
+    end else begin : wt_keep_wide
+      for (ik=0; ik<AXI_WIDTH/K_BITS; ik=ik+1) begin : wt_keep
+        assign s_axis_weights_tkeep_words[ik] = &s_axis_weights_tkeep[ik*(K_BITS/8) +: (K_BITS/8)];
+      end
     end
   endgenerate
 

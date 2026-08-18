@@ -1,4 +1,5 @@
 import json
+import math
 
 import numpy as np
 
@@ -11,18 +12,10 @@ import numpy as np
 UNSIGNED_ACTIVATIONS = {'relu'}
 
 # Activations this simulator executes as shift + clip, mirroring quant_lrelu
-# (deepsocflow/c/runtime.h:153) - the closed form only works for functions that are
+# (deepsocflow/c/runtime.h:179) - the closed form only works for functions that are
 # piecewise-linear through the origin. Curved activations (silu/tanh/sigmoid/gelu/
 # selu) are not supported at all.
-SUPPORTED_ACTIVATIONS = {'relu', 'identity'}
-
-
-def clip_to(values, bits, signed):
-    """Saturating clip to a fixed-point word, matching how brevitas's own
-    quantizers clip rather than wrap."""
-    if signed:
-        return np.clip(values, -2 ** (bits - 1), 2 ** (bits - 1) - 1)
-    return np.clip(values, 0, 2 ** bits - 1)
+SUPPORTED_ACTIVATIONS = {'relu', 'identity', 'leaky_relu'}
 
 
 def shift_round(n, s):
@@ -34,6 +27,71 @@ def shift_round(n, s):
         return n << (-s)
     half = np.int64(1) << (s - 1)
     return (n + half - (~(n >> s) & 1)) >> s
+
+
+def act_params(activation, negative_slope=0.0):
+    """(non_zero, plog_slope), the same formula as
+    deepsocflow/py/brevitas/export/adapter.py::act_params - duplicated rather
+    than imported (adapter.py imports FROM this module already, so the reverse
+    import would be circular), so keep the two in sync if either changes.
+
+    non_zero is 0 only for plain relu (slope 0); identity is modelled as
+    slope=1, which makes non_zero 1 and plog_slope 0. plog_slope is the
+    right-shift amount quant_lrelu applies to negative inputs, so it is only
+    non-zero for leaky_relu."""
+    if activation == 'relu':
+        return 0, 0
+    if activation == 'identity':
+        return 1, 0
+    if activation == 'leaky_relu':
+        assert negative_slope > 0, (
+            f"negative_slope={negative_slope} must be a negative power of two "
+            f"(0.5, 0.25, 0.125, ...) - quant_lrelu implements it as a shift")
+        log_slope = math.log2(negative_slope)
+        assert log_slope == int(log_slope) and log_slope <= 0, (
+            f"negative_slope={negative_slope} must be a negative power of two "
+            f"(0.5, 0.25, 0.125, ...) - quant_lrelu implements it as a shift")
+        return 1, -int(log_slope)
+    raise NotImplementedError(f"activation '{activation}' has no act_params mapping")
+
+
+def quant_lrelu(x, nzero, shift, pl_scale, x_bits):
+    """runtime.h's quant_lrelu (c/runtime.h:179), on an int64 array. Transcribed
+    (not re-derived) and pinned against the compiled C by
+    test_brevitas_conv.py::test_quant_lrelu_matches_c - the clip bound is
+    asymmetric in a way that is not obvious from a first read of the macro
+    (the negative side narrows by 2**pl_scale relative to the positive side:
+    -(2**(x_bits-pl_scale-1)) vs (2**(x_bits-1))-1), so getting this right by
+    algebra alone risks a transcription that looks plausible and disagrees
+    with the real firmware. No model built through this backend exercised
+    this function at all before leaky_relu support was added - relu/identity
+    only ever needed pl_scale=0, where the asymmetry vanishes.
+
+    x_bits is the hardware's own SIGNED activation width (hw.X_BITS in the C),
+    which FixedPointModel has no direct handle on (it is built from the graph
+    JSON alone, no Hardware object) - callers pass bundle['act_bits'] when the
+    activation is already signed at full width (identity, leaky_relu), but
+    must pass bundle['act_bits']+1 for relu: ptq.py narrows relu's declared
+    bit_width to bits-1 for its UNSIGNED [0, 2**(bits-1)-1] range, one bit
+    narrower than the SIGNED datapath width quant_lrelu's own clip always
+    operates in - passing the narrowed value directly here would clip a
+    perfectly in-range relu output to half its real range."""
+    x = np.asarray(x, dtype=np.int64)
+    pos = x << np.int64(pl_scale)
+    neg = x if nzero else np.zeros_like(x)
+    x = np.where(x < 0, neg, pos)
+    x = shift_round(x, shift)
+    lo = -(np.int64(1) << (x_bits - pl_scale - 1))
+    hi = (np.int64(1) << (x_bits - 1)) - 1
+    return np.clip(x, lo, hi)
+
+
+def _hw_x_bits(act_bits, act_signed):
+    """The width quant_lrelu's clip should use for a bundle/add declaring
+    (act_bits, act_signed) - see quant_lrelu's docstring. +1 undoes relu's
+    unsigned bits-1 narrowing; every other (signed) activation already runs
+    at the hardware's real width, unmodified."""
+    return act_bits if act_signed else act_bits + 1
 
 
 def conv2d_same_int(x_nhwc, w_hwio):
@@ -267,6 +325,7 @@ class FixedPointModel:
                     act_bits=cfg['add_act_bits'],
                     act_frac=cfg['add_act_frac'],
                     act_signed=cfg.get('add_act_signed', True),
+                    negative_slope=cfg.get('add_negative_slope', 0.0),
                 )
                 assert add_cfg['activation'] in SUPPORTED_ACTIVATIONS, (
                     f"bundle '{name}': add activation '{add_cfg['activation']}' is not "
@@ -301,6 +360,7 @@ class FixedPointModel:
                 act_bits=cfg['act_bits'],
                 act_frac=cfg['act_frac'],
                 act_signed=act_signed,
+                negative_slope=cfg.get('negative_slope', 0.0),
                 softmax=cfg['softmax'],
                 weight=None,  # populated by load_int_weights()
                 bias=None,
@@ -410,9 +470,15 @@ class FixedPointModel:
 
             acc = acc_in + bundle['bias']         # int64, frac = acc_frac
 
-            acc_for_shift = np.clip(acc, 0, None) if bundle['activation'] == 'relu' else acc
-            out = shift_round(acc_for_shift, acc_frac - bundle['act_frac'])
-            out = clip_to(out, bundle['act_bits'], bundle['act_signed'])
+            # quant_lrelu's own nzero-branching subsumes the old relu-only
+            # np.clip(acc,0,None) pre-step (nzero=0 already zeros negatives
+            # inside it), and its own clip subsumes the old clip_to call - see
+            # quant_lrelu's docstring for why this holds exactly, not just
+            # approximately, for every activation this bundle can declare.
+            ca_nzero, ca_pl_scale = act_params(bundle['activation'], bundle['negative_slope'])
+            ca_shift = ca_pl_scale + acc_frac - bundle['act_frac']
+            ca_x_bits = _hw_x_bits(bundle['act_bits'], bundle['act_signed'])
+            out = quant_lrelu(acc, ca_nzero, ca_shift, ca_pl_scale, ca_x_bits)
 
             # Pooling runs after the core activation, mirroring runtime.h's order
             # (CORE ACT -> residual -> POOLING). 'act' keeps the pre-pool tensor:
@@ -427,9 +493,10 @@ class FixedPointModel:
             if bundle['skip_from'] is not None:
                 add = bundle['add']
                 out = out + self.outputs[bundle['skip_from']]
-                acc_for_shift = np.clip(out, 0, None) if add['activation'] == 'relu' else out
-                out = shift_round(acc_for_shift, bundle['act_frac'] - add['act_frac'])
-                out = clip_to(out, add['act_bits'], add['act_signed'])
+                aa_nzero, aa_pl_scale = act_params(add['activation'], add['negative_slope'])
+                aa_shift = aa_pl_scale + bundle['act_frac'] - add['act_frac']
+                aa_x_bits = _hw_x_bits(add['act_bits'], add['act_signed'])
+                out = quant_lrelu(out, aa_nzero, aa_shift, aa_pl_scale, aa_x_bits)
 
             act_out = out
             if bundle['pool'] is not None:
