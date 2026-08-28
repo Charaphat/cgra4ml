@@ -36,8 +36,8 @@ typedef const struct {
   // actually needed a second tiling; o_bytes2/o_words2 size and bound-check that
   // second buffer independently of o_bytes/o_words above.
   //
-  // Same designated-initializer trap as ca_lut_idx below: the legacy qkeras
-  // exporter (deepsocflow/py/xmodel.py) does not emit these, so its
+  // Same designated-initializer trap noted throughout this file: the legacy
+  // qkeras exporter (deepsocflow/py/xmodel.py) does not emit these, so its
   // initializers leave them at C's default 0 - which would read as "bundle 0"
   // rather than "none". Safe because that exporter also never emits
   // N_BRANCH_BUNDLES, so the `#if defined(N_BRANCH_BUNDLES) && N_BRANCH_BUNDLES
@@ -48,14 +48,6 @@ typedef const struct {
   const i32  o_bytes2, o_words2;
   const i8   is_bias, is_pool, is_flatten, is_softmax;
   const i8   x_pad, b_val_shift, b_bias_shift, ca_nzero, ca_shift, ca_pl_scale, aa_nzero, aa_shift, aa_pl_scale, pa_nzero, pa_shift, pa_pl_scale, softmax_frac;
-  // Value-LUT activation (deepsocflow/py/brevitas/lut.py). ca_lut_idx indexes
-  // LUTS[] in config_fw.h, or is -1 for the quant_lrelu path; ca_lut_bits is the
-  // index width. NOTE: the legacy qkeras exporter (deepsocflow/py/xmodel.py) does
-  // not emit these, so its designated initializers leave them 0 - which would
-  // read as "use table 0". What makes that safe is that the same exporter also
-  // emits no N_LUTS, so the `#if defined(N_LUTS) && N_LUTS > 0` guard below compiles the lookup out
-  // entirely and these fields are never read. Keep the guard if you touch this.
-  const i8   ca_lut_idx, ca_lut_bits;
   const i8   csh, csh_shift, psh_shift, csw, csw_shift, psw_shift, pool;
   const i32  softmax_max_i;
   const u64  header;
@@ -197,25 +189,6 @@ static inline i32 quant_lrelu(i32 x, i8 nzero, i8 shift, i8 pl_scale){
   return x;
 }
 
-// Curved activations (silu/tanh/sigmoid/gelu/selu) have no shift-and-clip closed
-// form, so they are executed as a precomputed table instead. Still integer-only
-// and still multiplier-free: the index is reached by the same right shift every
-// other rescale in this project uses, then one load.
-//
-// `shift` lands the accumulator on the TABLE'S INDEX grid, not on the
-// activation's output grid - the table itself produces the output grid. The clip
-// is load-bearing: the mask alone would wrap an out-of-range accumulator to the
-// opposite sign instead of saturating at the end entry.
-//
-// The table is pre-permuted at export time (non-negative levels first, then
-// negative), so a signed index addresses it by its raw two's-complement bits with
-// no bias add - same trick as hls4ml's UnaryLUT.
-static inline i32 quant_lut(i32 x, i8 shift, i8 in_bits, const i8 *restrict lut){
-  x = shift_round(x, shift);
-  x = clip(x, -(1<<(in_bits-1)), (1<<(in_bits-1))-1);
-  return lut[x & ((1<<in_bits)-1)];
-}
-
 
 static inline void write_x(i32 val, i8 *restrict p_out_buffer, i32 o_bytes_bound, Memory_st *restrict mp, i32 ib, i32 ixp, i32 ixn, i32 ixl, i32 ixw, i32 ixcm, i32 ixr, Bundle_t *restrict pb_out, i32 xcm) {
 
@@ -340,7 +313,7 @@ static inline void tile_write( i32 out_val, i8 *restrict p_out_buffer, i8 *restr
   // nothing), early return. Guarded exactly like the write below: a
   // legacy-exporter build never emits N_BRANCH_BUNDLES, so it never
   // references ib_out2 at all here, not even in a condition that would
-  // happen to be harmless if it did - same rigor as the ca_lut_idx guard.
+  // happen to be harmless if it did.
 #if defined(N_BRANCH_BUNDLES) && N_BRANCH_BUNDLES > 0
   if (pb->ib_out == -1 && pb->ib_out2 == -1)
     return;
@@ -507,18 +480,7 @@ extern EXT_C void run(Memory_st *restrict mp) {
 
 
                     // ------ CORE ACT ------
-                    // N_LUTS is absent from the legacy qkeras exporter's
-                    // config_fw.h, so this compiles to the plain quant_lrelu call
-                    // there - which is also what keeps the unset ca_lut_* fields
-                    // safe (see Bundle_t). The < N_LUTS bound is a compile-time
-                    // constant and costs nothing.
-#if defined(N_LUTS) && N_LUTS > 0
-                    out_val = (pb->ca_lut_idx >= 0 && pb->ca_lut_idx < N_LUTS)
-                      ? quant_lut  (out_val, pb->ca_shift, pb->ca_lut_bits, LUTS[pb->ca_lut_idx])
-                      : quant_lrelu(out_val, pb->ca_nzero, pb->ca_shift, pb->ca_pl_scale);
-#else
                     out_val = quant_lrelu(out_val, pb->ca_nzero, pb->ca_shift, pb->ca_pl_scale);
-#endif
 
                     // ------ RESIDUAL ADD ---
 
