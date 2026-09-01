@@ -3,9 +3,19 @@ import json
 import os
 import subprocess
 import glob
-from deepsocflow.py.utils import *
-import deepsocflow
 import time
+
+# deepsocflow package root (parent of py/), computed from this file's own path -
+# NOT `import deepsocflow`, since deepsocflow/__init__.py pulls in the legacy
+# TensorFlow/qkeras stack this backend deliberately avoids. One extra dirname()
+# than you'd expect from "parent of py/" because this file lives a level deeper,
+# at deepsocflow/py/brevitas/hardware/hardware.py.
+_PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+
+def clog2(x):
+    '''Ceiling of log2(x): number of bits needed to represent x'''
+    return int(np.ceil(np.log2(x)))
 
 
 class Hardware:
@@ -13,20 +23,22 @@ class Hardware:
     Class to store static (pre-synthesis) parameters of the accelerator and export them to SystemVerilog and TCL scripts.
     """
     def __init__(
-            self, 
-            processing_elements: (int, int) = (8,24), 
-            frequency_mhz: int = 250, 
-            bits_input: int = 4, 
-            bits_weights: int = 4, 
-            bits_sum: int = 16, 
-            bits_bias: int = 16, 
-            max_batch_size: int = 512, 
-            max_channels_in: int = 512, 
-            max_kernel_size: int = 13, 
-            max_image_size: int = 32, 
+            self,
+            processing_elements: (int, int) = (8,24),
+            frequency_mhz: int = 250,
+            bits_input: int = 4,
+            bits_weights: int = 4,
+            bits_sum: int = 16,
+            bits_bias: int = 16,
+            max_batch_size: int = 512,
+            max_channels_in: int = 512,
+            max_kernel_size: int = 13,
+            max_image_size: int = 32,
             max_n_bundles: int = 64,
-            ram_weights_depth: int = 512, 
+            ram_weights_depth: int = 512,
             ram_edges_depth: int|None = 288,
+            delay_mul: int = 3,
+            delay_w_ram: int = 2,
             axi_width: int = 64,
             header_width: int = 64,
             config_baseaddr = "B0000000",
@@ -54,14 +66,19 @@ class Hardware:
             ram_edges_depth (int | None, optional): _description_. Defaults to None.
             target_cpu_int_bits (int, optional): _description_. Defaults to 32.
         """
-        
+
         self.params = locals()
         self.params = {k:self.params[k] for k in self.params if not k == 'self'}
-        
+
         # Validation
-        assert bits_input in [1,2,4,8] and bits_weights in [1,2,4,8]
+        # bits_input=16 is a real, RTL-supported width (dnn_engine.v's tkeep
+        # unpack and runtime.h's write_x both branch on X_BITS<=8 vs >8 - see
+        # the 2026-08-14 "widen activation datapath" work). bits_weights stays
+        # restricted to [1,2,4,8] - K_BITS widening is a separate, unstarted
+        # effort (only the weight-side tkeep generate branch exists so far).
+        assert bits_input in [1,2,4,8,16] and bits_weights in [1,2,4,8]
         assert bits_bias  in [8,16,32]
-        
+
         self.ROWS, self.COLS = processing_elements  # PE (processing element) array: rows, cols
         self.FREQ   = frequency_mhz
         self.X_BITS = bits_input     # activation (x) bitwidth
@@ -89,6 +106,10 @@ class Hardware:
         '''
 
         self.RAM_EDGES_DEPTH       = ram_edges_depth
+        # Were hardcoded in the config_hw.svh template as 'constant, for now';
+        # surfaced so the engine's pipeline depths can be swept.
+        self.DELAY_MUL             = delay_mul
+        self.DELAY_W_RAM           = delay_w_ram
         '''
         | Depth of RAM needed for edge padding.
         |     if k == 1 -> 0
@@ -108,7 +129,7 @@ class Hardware:
         self.Y_OUT_BITS            = 2**clog2(self.Y_BITS)      # conv-sum bitwidth rounded up to a power of two
         self.W_BPT                 = 32#clog2(self.ROWS*self.COLS*self.Y_OUT_BITS/8)  # weights bytes-per-transfer
 
-        self.MODULE_DIR = os.path.normpath(os.path.dirname(deepsocflow.__file__)).replace('\\', '/')
+        self.MODULE_DIR = os.path.normpath(_PACKAGE_ROOT).replace('\\', '/')
         self.TB_MODULE = tb_module  # testbench top module name
         self.SOURCES = \
             glob.glob(f'{self.MODULE_DIR}/test/sv/*.sv') + \
@@ -123,7 +144,7 @@ class Hardware:
         '''
         Exports the hardware parameters to a JSON file.
         '''
-        
+
         with open(path, 'w') as f:
             json.dump(self.params, f, indent=4)
 
@@ -133,7 +154,7 @@ class Hardware:
         '''
         Creates the Hardware object from an exported JSON file.
         '''
-        
+
         with open(path, 'r') as f:
             hw = Hardware(**json.load(f))
         return hw
@@ -149,9 +170,9 @@ class Hardware:
 
         with open('config_tb.svh', 'w') as f:
             f.write(f'''
-`define VALID_PROB {self.VALID_PROB} 
-`define READY_PROB {self.READY_PROB} 
-`define CLK_PERIOD {PERIOD_NS:.1f} 
+`define VALID_PROB {self.VALID_PROB}
+`define READY_PROB {self.READY_PROB}
+`define CLK_PERIOD {PERIOD_NS:.1f}
 `define INPUT_DELAY_NS  {INPUT_DELAY_NS :.1f}ns
 `define OUTPUT_DELAY_NS {OUTPUT_DELAY_NS:.1f}ns
 ''')
@@ -162,7 +183,7 @@ class Hardware:
         with open('config_hw.svh', 'w') as f:
             f.write(f'''
 // Written from Hardware.export()
-                    
+
 `define OR_NEGEDGE(RSTN)    {"or negedge RSTN" if self.ASYNC_RESETN else ""}
 
 `define ROWS                {self.ROWS               :<10}  // PE rows, constrained by resources
@@ -184,8 +205,8 @@ class Hardware:
 `define RAM_EDGES_DEPTH     {self.RAM_EDGES_DEPTH    :<10}  // max (KW * CI * XW), across layers when KW != 1
 `define W_BPT               {self.W_BPT              :<10}  // Width of output integer denoting bytes per transfer
 
-`define DELAY_MUL           3            // constant, for now 
-`define DELAY_W_RAM         2            // constant, for now 
+`define DELAY_MUL           {self.DELAY_MUL          :<10}  // multiplier pipeline depth
+`define DELAY_W_RAM         {self.DELAY_W_RAM        :<10}  // weight-RAM read latency
 
 `define AXI_WIDTH           {self.AXI_WIDTH          :<10}
 `define HEADER_WIDTH        {self.HEADER_WIDTH       :<10}
@@ -240,17 +261,17 @@ set CONFIG_BASEADDR    0x{self.CONFIG_BASEADDR}
                 f'-I{self.MODULE_DIR}/rtl/',
                 f'-F ../sources.txt',
                 f'--Mdir ./ ',
-                
+
                 f'-CFLAGS -DSIM ',
                 f'-CFLAGS -DTB_MODULE={self.TB_MODULE}',
                 f'-CFLAGS -DFB_MODULE=fb_axi_vip',
                 f'-CFLAGS -I../',
                 f'-CFLAGS -I{self.MODULE_DIR}/firebridge/',
                 f'-CFLAGS -g',
-                
+
                 f'{self.MODULE_DIR}/c/sim.c',
                 f'{self.MODULE_DIR}/firebridge/fb_top_verilator_wrap.cpp',
-                
+
                 '--Wno-INITIALDLY',
                 '--Wno-BLKANDNBLK',
                 '--Wno-UNOPTFLAT'
@@ -269,7 +290,7 @@ set CONFIG_BASEADDR    0x{self.CONFIG_BASEADDR}
             subprocess.run(["vvp", "build/a.out"])
         if SIM == 'verilator':
             assert subprocess.run([f"./V{self.TB_MODULE}"], cwd="build").returncode == 0
-        
+
         print(f"\n\nSIMULATION TIME: {time.time()-start:.2f} seconds\n\n")
 
 
@@ -281,7 +302,7 @@ set CONFIG_BASEADDR    0x{self.CONFIG_BASEADDR}
             scripts_dir_abspath = self.MODULE_DIR + '/tcl/fpga'
         if board_tcl_abspath is None:
             board_tcl_abspath = f'{scripts_dir_abspath}/{board}.tcl'
-        
+
         assert os.path.exists(board_tcl_abspath), f"Board script {board_tcl_abspath} does not exist."
         assert os.path.exists('./config_hw.tcl'), f"./config_hw.tcl does not exist."
 
